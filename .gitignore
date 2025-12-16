@@ -1,0 +1,5 @@
+Matcha-TTS-main/ 
+matcha_env/ 
+test wav/ 
+__pycache__/ 
+*.pyc 
