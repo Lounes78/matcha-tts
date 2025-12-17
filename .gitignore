@@ -2,5 +2,10 @@ Matcha_TTS_main/
 matcha_env/ 
 outpu/ 
 checkpoints/
+LJSpeech-1.1/
 __pycache__/ 
 *.pyc 
+*.wav
+struct
+
+
