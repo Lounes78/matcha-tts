@@ -1,6 +1,6 @@
 Matcha_TTS_main/ 
 matcha_env/ 
-test wav/ 
+outpu/ 
 checkpoints/
 __pycache__/ 
 *.pyc 
