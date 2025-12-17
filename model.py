@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from typing import Optional, Dict, Any
 from einops import rearrange, pack, repeat
 import numpy as np
+import math
 
 
 class LayerNorm(nn.Module):
@@ -112,5 +113,45 @@ class RotaryPositionalEmebeddings(nn.Module):
         """
         if self.cos_cahed is not None and x.shape[0] <= self.cos_cahed.shape[0]:
             
+## Decoder : 
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
 
+    def forward(self, x, scale=1000):
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device).float() * -emb) ## ->> Créer une séquence 
+        emb = scale * x.unsqueeze(1) * emb.unsqueeze(0) # -->  Multiplication entre les tenseurs
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1) # --> Concaténation des tenseurs (cos et sin)
+        return emb
      
+class Block1D(nn.Module):
+    def __init__(self, dim, dim_out, groups=8):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv1d(dim, dim_out, 3, padding=1), # Convolution 1D avec kernel size 3
+            nn.GroupNorm(groups, dim_out),
+            nn.Mish(), # Mish = x * tanh(softplus(x)
+        )
+
+    def forward(self, x, mask):
+        output = self.block(x * mask)
+        return output * mask
+    
+class ResnetBlock1D(nn.Module):
+    def __init__(self, dim, dim_out, time_emb_dim, groups=8):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Mish(), nn.Linear(time_emb_dim, dim_out)) 
+        self.block1 = Block1D(dim, dim_out, groups=groups) 
+        self.block2 = Block1D(dim_out, dim_out, groups=groups)
+        self.res_conv = nn.Conv1d(dim, dim_out, 1)
+
+    def forward(self, x, mask, time_emb):
+        h = self.block1(x, mask)
+        h += self.mlp(time_emb).unsqueeze(-1)
+        h = self.block2(h, mask)
+        output = h + self.res_conv(x * mask)
+        return output
