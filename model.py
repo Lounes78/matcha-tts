@@ -155,3 +155,41 @@ class ResnetBlock1D(nn.Module):
         h = self.block2(h, mask)
         output = h + self.res_conv(x * mask)
         return output
+
+
+class Downsample1D(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv = nn.Conv1d(dim, dim, 3, 2, 1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+class Upsample1D(nn.Module):
+    def __init__(self, dim, use_conv_transpose=True):
+        super().__init__()
+        self.use_conv_transpose = use_conv_transpose
+        if use_conv_transpose:
+            self.conv = nn.ConvTranspose1d(dim, dim, 4, 2, 1)
+        else:
+            self.conv = nn.Conv1d(dim, dim, 3, padding=1)
+
+    def forward(self, x):
+        if self.use_conv_transpose:
+            return self.conv(x)
+        x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+        return self.conv(x)
+    
+class TimestepEmbedding(nn.Module):
+    def __init__(self, in_channels, time_embed_dim, act_fn="silu"):
+        super().__init__()
+        self.linear_1 = nn.Linear(in_channels, time_embed_dim)
+        self.act = nn.SiLU() if act_fn == "silu" else nn.Mish()
+        self.linear_2 = nn.Linear(time_embed_dim, time_embed_dim)
+    
+    def forward(self, sample):
+        sample = self.linear_1(sample)
+        sample = self.act(sample)
+        sample = self.linear_2(sample)
+        return sample
+    
