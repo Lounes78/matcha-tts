@@ -7,6 +7,7 @@ import numpy as np
 import math
 
 
+
 class LayerNorm(nn.Module):
     def __init__(self, channels: int, eps=1e-4):
         super().__init__()
@@ -192,4 +193,104 @@ class TimestepEmbedding(nn.Module):
         sample = self.act(sample)
         sample = self.linear_2(sample)
         return sample
-    
+
+
+# partie 5 : Flow Matching Section
+
+class BASECFM(nn.Module):
+    """
+    Classe de base pour le Conditional Flow Matching.
+    Transforme du BRUIT en SPECTROGRAMME mel en suivant un "flux"
+    progressif de t=0 (bruit pur) à t=1 (spectrogramme réel).
+
+    """
+    def __init__(
+        self,
+        n_feats,
+        cfm_params,
+        n_spks=1,
+        spk_emb_dim=64,
+    ):
+        super().__init__()
+        self.n_feats = n_feats
+        self.n_spks = n_spks
+        self.spk_emb_dim = spk_emb_dim
+        self.solver = cfm_params.get("solver", "euler")
+        self.sigma_min = cfm_params.get("sigma_min", 1e-4)
+
+    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None):
+        z = torch.randn_like(mu) * temperature
+        dt = 1.0 / n_timesteps
+        dt = torch.tensor([dt] * z.shape[0], dtype=z.dtype, device=z.device)
+        # à vérfiier avec Arezki  mu, mask, spks
+        if self.solver == "euler":
+            for i in range(n_timesteps):
+                t = i / n_timesteps
+                t = torch.tensor([t] * z.shape[0], dtype=z.dtype, device=z.device)
+                pred = self.estimator(z, mask, mu, t, spks, cond) # à voir avec Decoder de Amira
+                z = z + pred * dt.unsqueeze(1).unsqueeze(1)
+        
+        elif self.solver == "midpoint":
+            for i in range(n_timesteps):
+                t = i / n_timesteps
+                t = torch.tensor([t] * z.shape[0], dtype=z.dtype, device=z.device)
+                pred = self.estimator(z, mask, mu, t, spks, cond) # à voir avec Decoder de Amira
+                z_mid = z + pred * dt.unsqueeze(1).unsqueeze(1) * 0.5
+                t_mid = t + dt * 0.5
+                pred_mid = self.estimator(z_mid, mask, mu, t_mid, spks, cond) # à voir avec Decoder de Amira
+                z = z + pred_mid * dt.unsqueeze(1).unsqueeze(1)
+        
+        else:
+            raise NotImplementedError(f"Solver {self.solver} not implemented")
+        
+        return z
+
+
+class CFM(BASECFM):
+    def __init__(
+        self,
+        n_feats,
+        cfm_params,
+        n_spks=1,
+        spk_emb_dim=64,
+        estimator=None,
+    ):
+        super().__init__(
+            n_feats,
+            cfm_params,
+            n_spks=n_spks,
+            spk_emb_dim=spk_emb_dim,
+        )
+        
+        in_channels = n_feats
+        if estimator is None:
+            raise ValueError("estimator must be provided")
+        
+        self.estimator = estimator # pareil à vérifier avec Amira
+
+    @torch.inference_mode()
+    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None):
+        return super().forward(
+            mu=mu,
+            mask=mask,
+            n_timesteps=n_timesteps,
+            temperature=temperature,
+            spks=spks,
+            cond=cond,
+        )
+
+    def compute_loss(self, x1, mask, mu, spks=None, cond=None): 
+        b, _, t = mu.shape
+
+        t = torch.rand([b, 1, 1], device=mu.device, dtype=mu.dtype)
+        z = torch.randn_like(x1)
+
+        y_t = (1 - (1 - self.sigma_min) * t) * z + t * x1
+        u_t = x1 - (1 - self.sigma_min) * z
+
+        pred = self.estimator(y_t, mask, mu, t.squeeze(), spks, cond)
+
+        loss = F.mse_loss(pred * mask, u_t * mask, reduction="sum") / (
+            torch.sum(mask) * u_t.shape[1]
+        )
+        return loss, y_t, pred, u_t
