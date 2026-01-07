@@ -375,7 +375,7 @@ class MultiHeadAttention(nn.Module):
 
 
 class FFN(nn.Module):
-    def __ini__(self, in_channels, out_channels, filter_channels, kernel_size, p_dropout=0.0):
+    def __init__(self, in_channels, out_channels, filter_channels, kernel_size, p_dropout=0.0):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
