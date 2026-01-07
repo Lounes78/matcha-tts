@@ -112,7 +112,7 @@ class RotaryPositionalEmebeddings(nn.Module):
         Cache cos and sin values
         """
         if self.cos_cahed is not None and x.shape[0] <= self.cos_cahed.shape[0]:
-            return 
+            pass # this pat is lounes part  
 ## Decoder : 
 
 class SinusoidalPosEmb(nn.Module):
