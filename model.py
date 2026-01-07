@@ -25,7 +25,7 @@ class LayerNorm(nn.Module):
         shape = [1, -1] + [1] * (n_dims - 2)  # (B, C, T)
         x = x * self.gamma.view(*shape) + self.beta.view(*shape) # aka x = x * self.gamma.view(1, -1, 1) + self.beta.view(1, -1, 1)
         return x
-    
+
 
 class ConvReluNorm(nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels, kernel_size, n_layers, p_dropout):
