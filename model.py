@@ -11,7 +11,7 @@ We used the following reference repository: https://github.com/shivammehta25/Mat
 Find on Docs/Matcha-tts One file Implementation the definition of the different components 
 and who each one part works.
 
-code by Arezki , Lounes , faycal , amira
+code by arezki , lounes , fayçal , amira
 
 """
 
