@@ -11,7 +11,7 @@ We used the following reference repository: https://github.com/shivammehta25/Mat
 Find on Docs/Matcha-tts One file Implementation the definition of the different components 
 and who each one part works.
 
-code by Arezki , Lounes , faycal , amira
+code by arezki , lounes , fayçal , amira
 
 """
 
@@ -29,6 +29,8 @@ from typing import Optional, Dict, Any
 from einops import rearrange, pack, repeat
 import numpy as np
 import math
+import datetime as dt
+
 
 
 
@@ -243,8 +245,6 @@ class DurationPredictor(nn.Module):
 
 
 
-
-
 class RotaryPositionalEmebeddings(nn.Module):
     def __init__(self, d: int, base: int = 10_000):
         """
@@ -262,26 +262,310 @@ class RotaryPositionalEmebeddings(nn.Module):
         Cache cos and sin values
         """
         if self.cos_cahed is not None and x.shape[0] <= self.cos_cahed.shape[0]:
-            pass # this pat is lounes part
+            return
+        
+        seq_len = x.shape[0]
+        theta = 1.0 / (self.base ** (torch.arange(0, self.d, 2).float() / self.d)).to(x.device)
+
+        seq_idx = torch.arange(seq_len, device=x.device).float().to(x.device)
+        idx_theta = torch.einsum('n,d->nd', seq_idx, theta)  # (seq_len, d/2)
+        idx_theta2 = torch.cat([idx_theta, idx_theta], dim=1)  # (seq_len, d)
+
+        # cache them
+        self.cos_cahed = idx_theta2.cos()[:, None, None, :]  # (seq_len, 1, 1, d)
+        self.sin_cached = idx_theta2.sin()[:, None, None, :]  # (seq_len, 1, 1, d)
+
+    def _neg_half(self, x:torch.Tensor):
+        d_2 = self.d // 2
+        return torch.cat([-x[:, :, :, d_2:], x[:, :, :, :d_2]], dim=-1)
+    
+    def forward(self, x: torch.Tensor):
+        """
+        'x' is the Tensor at the head of a key or a query with shape [seq_len, batch_size, n_heads, d]
+        """
+        x = rearrange(x, 'b h t d -> t b h d')  # (seq_len, batch_size, n_heads, d)
+
+        self._build_cache(x)
+
+        x_rope, x_pass = x[..., :self.d], x[..., self.d:]  # (seq_len, batch_size, n_heads, d), (seq_len, batch_size, n_heads, d_pass)
+
+        neg_half_x = self._neg_half(x_rope)
+
+        x_rope = (x_rope * self.cos_cahed[: x.shape[0]]) + (neg_half_x * self.sin_cached[: x.shape[0]])
+
+        return rearrange(torch.cat((x_rope, x_pass), dim=-1), "t b h d -> b h t d")
+    
+class MultiHeadAttention(nn.Module):
+    def __init__(
+            self,
+            channels,
+            out_channels,
+            n_heads,
+            heads_share=True,
+            p_dropout=0.0,
+            proximal_bias=False,
+            proximal_init=False,
+    ):
+        super().__init__()
+        assert channels % n_heads == 0, "channels must be divisible by n_heads"
+        self.channels = channels
+        self.out_channels = out_channels
+        self.n_heads = n_heads
+        self.heads_share = heads_share
+        self.p_dropout = p_dropout
+        self.proximal_bias = proximal_bias
+        
+        self.attn = None
+
+        self.k_channels = channels // n_heads
+        self.conv_q = nn.Conv1d(channels, channels, kernel_size=1)
+        self.conv_k = nn.Conv1d(channels, channels, kernel_size=1)
+        self.conv_v = nn.Conv1d(channels, channels, kernel_size=1)
+
+        self.query_rotary_pe = RotaryPositionalEmebeddings(self.k_channels*0.5)
+        self.key_rotary_pe = RotaryPositionalEmebeddings(self.k_channels*0.5)
+
+        self.conv_o = torch.nn.Conv1d(channels, out_channels, kernel_size=1)
+        self.drop = torch.nn.Dropout(p_dropout)
+
+        torch.nn.init.xavier_uniform_(self.conv_q.weight)
+        torch.nn.init.xavier_uniform_(self.conv_k.weight)
+        if proximal_init:
+            self.conv_k.weight.data.copy_(self.conv_q.weight.data)
+            self.conv_k.bias.data.copy_(self.conv_q.bias.data)
+        torch.nn.init.xavier_uniform_(self.conv_v.weight)
+
+    
+    def forward(self, x, c, attn_mask=None):
+        q = self.conv_q(x)
+        k = self.conv_k(c)
+        v = self.conv_v(c)
+
+        x, self.attn = self.attention(q, k, v, mask=attn_mask)
+
+        x = self.conv_o(x)
+        return x 
+    
+    def attention(self, query, key, value, mask=None):
+        b, d, t_s, t_t = (*key.size(), query.size(2))
+        query = rearrange(query, "b (h c) t-> b h t c", h=self.n_heads)
+        key = rearrange(key, "b (h c) t-> b h t c", h=self.n_heads)
+        value = rearrange(value, "b (h c) t-> b h t c", h=self.n_heads)
+
+        query = self.query_rotary_pe(query)
+        key = self.key_rotary_pe(key)
+
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.k_channels)
+
+        if self.proximal_bias:
+            assert t_s == t_t, "imal bias is only available for self-attention"
+            scores = scores + self._attention_bias_proximal(t_s).to(device=scores.device, dtype=scores.dtype)
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e4)
+        p_attn = torch.nn.functional.softmax(scores, dim=-1)
+        p_attn = self.drop(p_attn)
+        output = torch.matmul(p_attn, value)
+        output = output.transpose(2, 3).contiguous().view(b, d, t_t)
+        return output, p_attn
+    
+    @staticmethod
+    def _attention_bias_proximal(length):
+        r = torch.arange(length, dtype=torch.float32)
+        diff = torch.unsqueeze(r, 0) - torch.unsqueeze(r, 1)
+        return torch.unsqueeze(torch.unsqueeze(-torch.log1p(torch.abs(diff)), 0))
+    
 
 
+class FFN(nn.Module):
+    def __init__(self, in_channels, out_channels, filter_channels, kernel_size, p_dropout=0.0):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.filter_channels = filter_channels
+        self.kernel_size = kernel_size
+        self.p_dropout = p_dropout
 
+        self.conv_1 = torch.nn.Conv1d(in_channels, filter_channels, kernel_size, padding=kernel_size // 2)
+        self.conv_2 = torch.nn.Conv1d(filter_channels, out_channels, kernel_size, padding=kernel_size // 2)
+        self.drop = torch.nn.Dropout(p_dropout)
 
-#il manque :
+    def forward(self, x, x_mask):
+        x = self.conv_1(x * x_mask)
+        x = torch.relu(x)
+        x = self.drop(x)
+        x = self.conv_2(x * x_mask)
+        return x * x_mask
+    
+class Encoder(nn.Module):
+    def __init__(
+            self,
+            hidden_channels,
+            filter_channels, 
+            n_heads,
+            n_layers,
+            kernel_size=1,
+            p_dropout=0.0
+    ):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.filter_channels = filter_channels
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.p_dropout = p_dropout
 
-#  MultiHeadAttention(nn.Module) "
-# FFN(nn.Module)
-# Encoder(nn.Module)
- 
+        self.drop = torch.nn.Dropout(p_dropout)
+        self.attn_layers = torch.nn.ModuleList()
+        self.norm_layers_1 = torch.nn.ModuleList()
+        self.ffn_layers = torch.nn.ModuleList()
+        self.norm_layers_2 = torch.nn.ModuleList()
 
+        for _ in range(self.n_layers):
+            self.attn_layers.append(MultiHeadAttention(hidden_channels, hidden_channels, n_heads, p_dropout=p_dropout))
+            self.norm_layers_1.append(LayerNorm(hidden_channels))
+            self.ffn_layers.append(
+                FFN(
+                    hidden_channels,
+                    hidden_channels,
+                    filter_channels,
+                    kernel_size,
+                    p_dropout=p_dropout,
+                )
+            )
+            self.norm_layers_2.append(LayerNorm(hidden_channels))
+    
+    def forward(self, x, x_mask):
+        attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
+        for i in range(self.n_layers):
+            x = x * x_mask
+            y = self.attn_layers[i](x, x, attn_mask)
+            y = self.drop(y)
+            x = self.norm_layers_1[i](x + y)
+            y = self.ffn_layers[i](x, x_mask)
+            y = self.drop(y)
+            x = self.norm_layers_2[i](x + y)
+        x = x * x_mask
+        return x 
+    
 
 
 #                             2.3 Main Text Encoder
 
 
-# il manque :
-#TesxtEncoder(nn.Module)
 
+class TextEncoder(nn.Module):
+    def __init__(
+        self, 
+        encoder_type, 
+        encoder_params,
+        duration_predictor_params,
+        n_vocab,
+        n_spks=1,
+        spk_emb_dim=128,
+    ):
+        super().__init__()
+        self.encoder_type = encoder_type
+        self.n_vocab = n_vocab
+        self.n_feats = encoder_params.n_feats
+        self.n_channels = encoder_params.n_channels
+        self.spk_emb_dim = spk_emb_dim
+        self.n_spks = n_spks
+
+        self.emb = torch.nn.Embedding(n_vocab, self.n_channels)
+        torch.nn.init.normal_(self.emb.weight, 0.0, self.n_channels**-0.5)
+
+        if encoder_params.prenet:
+                    self.prenet = ConvReluNorm(
+                        self.n_channels,
+                        self.n_channels,
+                        self.n_channels,
+                        kernel_size=5,
+                        n_layers=3,
+                        p_dropout=0.5,
+                    )
+        else:
+            self.prenet = lambda x, x_mask: x
+
+        self.encoder = Encoder(
+            encoder_params.n_channels + (spk_emb_dim if n_spks > 1 else 0),
+            encoder_params.filter_channels,
+            encoder_params.n_heads,
+            encoder_params.n_layers,
+            encoder_params.kernel_size,
+            encoder_params.p_dropout,
+        )
+
+        self.proj_m = torch.nn.Conv1d(self.n_channels + (spk_emb_dim if n_spks > 1 else 0), self.n_feats, 1)
+        self.proj_w = DurationPredictor(
+            self.n_channels + (spk_emb_dim if n_spks > 1 else 0),
+            duration_predictor_params.filter_channels_dp,
+            duration_predictor_params.kernel_size,
+            duration_predictor_params.p_dropout,
+        )
+
+    def forward(self, x, x_lengths, spks=None):
+        """Run forward pass to the transformer based encoder and duration predictor
+
+        Args:
+            x (torch.Tensor): text input
+                shape: (batch_size, max_text_length)
+            x_lengths (torch.Tensor): text input lengths
+                shape: (batch_size,)
+            spks (torch.Tensor, optional): speaker ids. Defaults to None.
+                shape: (batch_size,)
+
+        Returns:
+            mu (torch.Tensor): average output of the encoder
+                shape: (batch_size, n_feats, max_text_length)
+            logw (torch.Tensor): log duration predicted by the duration predictor
+                shape: (batch_size, 1, max_text_length)
+            x_mask (torch.Tensor): mask for the text input
+                shape: (batch_size, 1, max_text_length)
+        """
+        x = self.emb(x) * math.sqrt(self.n_channels)
+        x = torch.transpose(x, 1, -1)
+        x_mask = torch.unsqueeze(sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
+
+        x = self.prenet(x, x_mask)
+        if self.n_spks > 1:
+            x = torch.cat([x, spks.unsqueeze(-1).repeat(1, 1, x.shape[-1])], dim=1)
+        x = self.encoder(x, x_mask)
+        mu = self.proj_m(x) * x_mask
+
+        x_dp = torch.detach(x)
+        logw = self.proj_w(x_dp, x_mask)
+
+        return mu, logw, x_mask
+    
+
+# ### The Walkthrough
+
+# 1. **Look up the meaning (`self.emb(x)`):**
+# The input `x` comes in as a simple list of ID numbers (like "Word #45, Word #12"). The model looks these up in its internal dictionary to turn them into rich lists of numbers (vectors) that represent the *meaning* of each character or phoneme.
+# 2. **Rotate the data (`transpose`):**
+# The model prefers to work with the data sideways (features in the middle) compared to how it came in. This flips it to the correct orientation for the machinery that follows.
+# 3. **Create a validity map (`x_mask`):**
+# Since sentences have different lengths, we often add empty space (padding) to make them all fit in a batch. This step creates a "mask" that tells the model: "Pay attention to these real words, but completely ignore the empty space at the end."
+# 4. **Initial Polish (`self.prenet`):**
+# Before the heavy thinking starts, the data goes through a "Pre-Network." This is like a rough draft or a filter that smooths out the incoming data and gathers local details (like which letters are next to each other).
+# 5. **Add Speaker Identity (`if self.n_spks > 1`):**
+# If the model can speak in different voices, it needs to know *who* is talking. Here, it takes the "Speaker ID" (e.g., "Voice A") and attaches that tag to every single word in the sentence. Now the model knows: "Say 'Hello', and say it like Speaker A."
+# 6. **Deep Thinking (`self.encoder`):**
+# This is the "brain." It looks at the whole sentence at once. It figures out context—for example, knowing that the word "read" sounds different in "I will read" vs "I have read." It refines the understanding of the text.
+# 7. **Predict Sound Features (`mu = self.proj_m`):**
+# Now that it understands the text, it translates that understanding into acoustic features (the "ingredients" of sound, like tone and resonance) that the vocoder will later turn into audio.
+# 8. **Freeze and Predict Timing (`detach` & `logw`):**
+# * **`detach`:** It takes a snapshot of the encoder's understanding. It effectively says, "Don't let the next step change how we understood the text; just use this snapshot."
+# * **`logw` (Duration):** Using that snapshot, it guesses how long each character should be spoken (e.g., the 'a' in 'cat' is short, the 'o' in 'cool' is long).
+
+
+# ---
+# ### Why `* math.sqrt(n_channels)`?
+
+# This is a specific trick from the original "Attention Is All You Need" paper.
+# **The Reason:**
+# When the model looks up the word vectors (embeddings), those numbers are usually very small (close to 0 or 1). However, as the data flows deeper into the network, values tend to get added together and grow larger.
+# If the starting numbers are too small, the signal gets "drowned out" or fades away before the model can use it effectively. Multiplying by the square root of the size (e.g., ) acts like an **amplifier**. It boosts the signal strength of the words right at the start so they remain significant throughout the entire process.
 
 
 
@@ -826,3 +1110,318 @@ class CFM(BASECFM):
 ####################################################################################################
 
 #<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< 5. MatchaTTSModel >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+
+
+class Matchatts(nn.Module):
+    """
+    Main Matcha-TTS model combining TextEncoder and CFM decoder.
+    Standalone implementation (no Lightning dependency).
+    """
+    
+    def __init__(
+        self,
+        n_vocab: int,
+        n_spks: int,
+        spk_emb_dim: int,
+        n_feats: int,
+        encoder_config: Dict[str, Any],
+        decoder_config: Dict[str, Any],
+        cfm_config: Dict[str, Any],
+        data_statistics: Optional[Dict[str, Any]] = None,
+        prior_loss: bool = True,
+    ):
+        super().__init__()
+        
+        self.n_vocab = n_vocab
+        self.n_spks = n_spks
+        self.spk_emb_dim = spk_emb_dim
+        self.n_feats = n_feats
+        self.prior_loss = prior_loss
+        
+        # Speaker embedding (if multi-speaker)
+        if n_spks > 1:
+            self.spk_emb = nn.Embedding(n_spks, spk_emb_dim)
+        
+        # Text Encoder (Lounes' part)
+        self.encoder = TextEncoder(
+            encoder_type=encoder_config['encoder_type'],
+            encoder_params=encoder_config['encoder_params'],
+            duration_predictor_params=encoder_config['duration_predictor_params'],
+            n_vocab=n_vocab,
+            n_spks=n_spks,
+            spk_emb_dim=spk_emb_dim,
+        )
+        
+        # Create Decoder (Amira's part)
+        decoder = Decoder(
+            in_channels=n_feats,
+            mu_channels=n_feats,
+            out_channels=n_feats,
+            channels=decoder_config['channels'],
+            num_res_blocks=decoder_config.get('num_res_blocks', 2),
+            num_transformer_blocks=decoder_config.get('num_transformer_blocks', 1),
+            num_heads=decoder_config.get('num_heads', 2),
+            time_emb_dim=decoder_config.get('time_emb_dim', 160),
+            time_mlp_dim=decoder_config.get('time_mlp_dim', 1024),
+            dropout=decoder_config.get('dropout', 0.05),
+            ffn_mult=decoder_config.get('ffn_mult', 4),
+        )
+        
+        # Wrap Decoder in CFM (Fayçal's part)
+        self.decoder = CFM(
+            n_feats=n_feats,
+            cfm_params=cfm_config,
+            n_spks=n_spks,
+            spk_emb_dim=spk_emb_dim,
+            estimator=decoder,
+        )
+        
+        # Initialize mel statistics (for normalization)
+        self.register_buffer('mel_mean', torch.zeros(n_feats))
+        self.register_buffer('mel_std', torch.ones(n_feats))
+        
+        if data_statistics is not None:
+            self.update_data_statistics(data_statistics)
+    
+    def update_data_statistics(self, data_statistics: Dict[str, Any]):
+        """
+        Update mel-spectrogram normalization statistics.
+        
+        Args:
+            data_statistics: dict with 'mel_mean' and 'mel_std' keys
+        """
+        if data_statistics is None:
+            return
+        
+        if 'mel_mean' in data_statistics:
+            mel_mean = data_statistics['mel_mean']
+            
+            if not isinstance(mel_mean, torch.Tensor):
+                if isinstance(mel_mean, (list, np.ndarray)):
+                    mel_mean = torch.tensor(mel_mean, dtype=torch.float32)
+                elif isinstance(mel_mean, (int, float)):
+                    mel_mean = torch.full((self.n_feats,), mel_mean, dtype=torch.float32)
+            
+            self.mel_mean = mel_mean.to(self.mel_mean.device)
+            
+        if 'mel_std' in data_statistics:
+            mel_std = data_statistics['mel_std']
+            
+            if not isinstance(mel_std, torch.Tensor):
+                if isinstance(mel_std, (list, np.ndarray)):
+                    mel_std = torch.tensor(mel_std, dtype=torch.float32)
+                elif isinstance(mel_std, (int, float)):
+                    mel_std = torch.full((self.n_feats,), mel_std, dtype=torch.float32)
+            
+            self.mel_std = mel_std.to(self.mel_std.device)
+    
+    @torch.inference_mode()
+    def synthesise(
+        self,
+        x: torch.Tensor,
+        x_lengths: torch.Tensor,
+        n_timesteps: int = 10,
+        temperature: float = 1.0,
+        spks: Optional[torch.Tensor] = None,
+        length_scale: float = 1.0,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Generates mel-spectrogram from text. Returns:
+            1. encoder outputs
+            2. decoder outputs
+            3. generated alignment
+
+        Args:
+            x (torch.Tensor): batch of texts, converted to a tensor with phoneme embedding ids.
+                shape: (batch_size, max_text_length)
+            x_lengths (torch.Tensor): lengths of texts in batch.
+                shape: (batch_size,)
+            n_timesteps (int): number of steps to use for reverse diffusion in decoder.
+            temperature (float, optional): controls variance of terminal distribution.
+            spks (bool, optional): speaker ids.
+                shape: (batch_size,)
+            length_scale (float, optional): controls speech pace.
+                Increase value to slow down generated speech and vice versa.
+
+        Returns:
+            dict: {
+                "encoder_outputs": torch.Tensor, shape: (batch_size, n_feats, max_mel_length),
+                # Average mel spectrogram generated by the encoder
+                "decoder_outputs": torch.Tensor, shape: (batch_size, n_feats, max_mel_length),
+                # Refined mel spectrogram improved by the CFM
+                "attn": torch.Tensor, shape: (batch_size, max_text_length, max_mel_length),
+                # Alignment map between text and mel spectrogram
+                "mel": torch.Tensor, shape: (batch_size, n_feats, max_mel_length),
+                # Denormalized mel spectrogram
+                "mel_lengths": torch.Tensor, shape: (batch_size,),
+                # Lengths of mel spectrograms
+                "rtf": float,
+                # Real-time factor
+            }
+        """
+        # For RTF computation
+        t = dt.datetime.now()
+
+        if self.n_spks > 1:
+            # Get speaker embedding
+            spks = self.spk_emb(spks.long())
+
+        # Get encoder_outputs `mu_x` and log-scaled token durations `logw`
+        mu_x, logw, x_mask = self.encoder(x, x_lengths, spks)
+
+        w = torch.exp(logw) * x_mask
+        w_ceil = torch.ceil(w) * length_scale
+        y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
+        y_max_length = y_lengths.max()
+        y_max_length_ = fix_len_compatibility(y_max_length)
+
+        # Using obtained durations `w` construct alignment map `attn`
+        y_mask = sequence_mask(y_lengths, y_max_length_).unsqueeze(1).to(x_mask.dtype)
+        attn_mask = x_mask.unsqueeze(-1) * y_mask.unsqueeze(2)
+        attn = generate_path(w_ceil.squeeze(1), attn_mask.squeeze(1)).unsqueeze(1)
+
+        # Align encoded text and get mu_y
+        mu_y = torch.matmul(attn.squeeze(1).transpose(1, 2), mu_x.transpose(1, 2))
+        mu_y = mu_y.transpose(1, 2)
+        encoder_outputs = mu_y[:, :, :y_max_length]
+
+        # Generate sample tracing the probability flow
+        decoder_outputs = self.decoder(mu_y, y_mask, n_timesteps, temperature, spks)
+        decoder_outputs = decoder_outputs[:, :, :y_max_length]
+
+        t = (dt.datetime.now() - t).total_seconds()
+        rtf = t * 22050 / (decoder_outputs.shape[-1] * 256)
+
+        return {
+            "encoder_outputs": encoder_outputs,
+            "decoder_outputs": decoder_outputs,
+            "attn": attn[:, :, :y_max_length],
+            "mel": denormalize(decoder_outputs, self.mel_mean, self.mel_std),
+            "mel_lengths": y_lengths,
+            "rtf": rtf,
+        }
+
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        x_lengths: torch.Tensor, 
+        y: torch.Tensor, 
+        y_lengths: torch.Tensor, 
+        spks: Optional[torch.Tensor] = None,
+        out_size: Optional[int] = None,
+        cond: Optional[torch.Tensor] = None,
+        durations: Optional[torch.Tensor] = None,
+    ):
+        """
+        Computes 3 losses:
+            1. duration loss: loss between predicted token durations and those extracted by Monotonic Alignment Search (MAS).
+            2. prior loss: loss between mel-spectrogram and encoder outputs.
+            3. flow matching loss: loss between mel-spectrogram and decoder outputs.
+
+        Args:
+            x (torch.Tensor): batch of texts, converted to a tensor with phoneme embedding ids.
+                shape: (batch_size, max_text_length)
+            x_lengths (torch.Tensor): lengths of texts in batch.
+                shape: (batch_size,)
+            y (torch.Tensor): batch of corresponding mel-spectrograms.
+                shape: (batch_size, n_feats, max_mel_length)
+            y_lengths (torch.Tensor): lengths of mel-spectrograms in batch.
+                shape: (batch_size,)
+            out_size (int, optional): length (in mel's sampling rate) of segment to cut, on which decoder will be trained.
+                Should be divisible by 2^{num of UNet downsamplings}. Needed to increase batch size.
+            spks (torch.Tensor, optional): speaker ids.
+                shape: (batch_size,)
+        """
+        if self.n_spks > 1:
+            # Get speaker embedding
+            spks = self.spk_emb(spks)
+
+        # Get encoder_outputs `mu_x` and log-scaled token durations `logw`
+        mu_x, logw, x_mask = self.encoder(x, x_lengths, spks)
+        y_max_length = y.shape[-1]
+
+        y_mask = sequence_mask(y_lengths, y_max_length).unsqueeze(1).to(x_mask)
+        attn_mask = x_mask.unsqueeze(-1) * y_mask.unsqueeze(2)
+
+        # Use MAS to find most likely alignment `attn` between text and mel-spectrogram
+        with torch.no_grad():
+            const = -0.5 * math.log(2 * math.pi) * self.n_feats
+            factor = -0.5 * torch.ones(mu_x.shape, dtype=mu_x.dtype, device=mu_x.device)
+            y_square = torch.matmul(factor.transpose(1, 2), y**2)
+            y_mu_double = torch.matmul(2.0 * (factor * mu_x).transpose(1, 2), y)
+            mu_square = torch.sum(factor * (mu_x**2), 1).unsqueeze(-1)
+            log_prior = y_square - y_mu_double + mu_square + const
+
+            # Simplified alignment (you would use monotonic_align.maximum_path in full version)
+            attn = generate_path(torch.exp(logw).squeeze(1), attn_mask.squeeze(1))
+
+        # Compute loss between predicted log-scaled durations and those obtained from MAS
+        logw_ = torch.log(1e-8 + torch.sum(attn.unsqueeze(1), -1)) * x_mask
+        dur_loss = duration_loss(logw, logw_, x_lengths)
+
+        # Align encoded text with mel-spectrogram and get mu_y segment
+        mu_y = torch.matmul(attn.squeeze(1).transpose(1, 2) if attn.dim() == 3 else attn.transpose(1, 2), 
+                           mu_x.transpose(1, 2))
+        mu_y = mu_y.transpose(1, 2)
+
+        # Compute loss of the decoder
+        diff_loss, _ = self.decoder.compute_loss(x1=y, mask=y_mask, mu=mu_y, spks=spks, cond=cond)
+
+        if self.prior_loss:
+            prior_loss = torch.sum(0.5 * ((y - mu_y) ** 2 + math.log(2 * math.pi)) * y_mask)
+            prior_loss = prior_loss / (torch.sum(y_mask) * self.n_feats)
+        else:
+            prior_loss = torch.tensor(0.0, device=y.device)
+
+        return dur_loss, prior_loss, diff_loss, attn
+    
+    @staticmethod
+    def load_from_checkpoint(checkpoint_path: str, map_location='cpu'):
+        # Load with weights_only=False to handle OmegaConf objects
+        checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
+        hparams = checkpoint['hyper_parameters']
+        
+        # Initialize your model with the checkpoint hyperparameters
+        model = Matchatts(
+            n_vocab=hparams['n_vocab'],
+            n_spks=hparams['n_spks'],
+            spk_emb_dim=hparams['spk_emb_dim'],
+            n_feats=hparams['n_feats'],
+            encoder_config=hparams['encoder'],
+            decoder_config=hparams['decoder'], 
+            cfm_config=hparams['cfm']
+        )
+        
+        raw_state_dict = checkpoint['state_dict']
+        new_state_dict = {}
+
+        for key, value in raw_state_dict.items():
+            new_key = key.replace('model.', '') # Just in case
+            
+            # --- KEY REMAPPING LOGIC ---
+            # 1. Handle Decoder nesting
+            # Your model uses: decoder (CFM) -> estimator (UNet)
+            # Checkpoint uses: decoder (UNet) directly or different nesting
+            if new_key.startswith("decoder.") and not new_key.startswith("decoder.estimator."):
+                new_key = new_key.replace("decoder.", "decoder.estimator.")
+                
+            # 2. Handle Mel Statistics (Standardization)
+            if 'mel_mean' in new_key or 'mel_std' in new_key:
+                if value.numel() == 1:
+                    value = torch.full((hparams['n_feats'],), value.item())
+            
+            new_state_dict[new_key] = value
+
+        # Load with strict=False to see remaining mismatches
+        missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
+        
+        print(f" State dict processed.")
+        if missing:
+            # We expect SnakeBeta alpha/beta to be missing since official uses Mish
+            print(f" Missing keys (e.g., activations): {len(missing)}")
+        if unexpected:
+            print(f" Unexpected keys: {len(unexpected)}")
+            
+        model.eval()
+        return model
