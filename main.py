@@ -126,7 +126,7 @@ with torch.no_grad():
 
 import soundfile as sf
 sf.write("output.wav", audio.numpy(), 22050)
-print("✅ Complete TTS pipeline finished!")
-print("🎵 Audio saved as output.wav")
-print(f"📊 Final audio shape: {audio.shape} samples")
-print(f"⏱️  Audio duration: {audio.shape[0] / 22050:.2f} seconds")
+print("Complete TTS pipeline finished!")
+print("Audio saved as output.wav")
+print(f"Final audio shape: {audio.shape} samples")
+print(f"Audio duration: {audio.shape[0] / 22050:.2f} seconds")
