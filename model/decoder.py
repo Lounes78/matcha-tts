@@ -8,8 +8,6 @@ from model.transformer import BasicTransformerBlock
 from model.unet_blocks import ResnetBlock1D, Downsample1D, Upsample1D, SinusoidalPosEmb, TimestepEmbedding
 
 
-
-
 class Decoder(nn.Module):
     
 

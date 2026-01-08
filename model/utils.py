@@ -10,6 +10,11 @@ import numpy as np
 import torch
 
 
+
+def get_pylogger() :
+    pass
+
+
 def sequence_mask(length, max_length=None):
     if max_length is None:
         max_length = length.max()
@@ -94,3 +99,4 @@ def denormalize(data, mu, std):
         std = std.unsqueeze(-1)
 
     return data * std + mu
+

@@ -196,3 +196,5 @@ def collapse_whitespace(text):
     """Replace multiple spaces with single space"""
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
+
+
