@@ -132,9 +132,9 @@ def load_custom_matcha(checkpoint_path, device):
 # ----------------------------------------------------------------------------------------------------------------------
 def load_vocoder(device):
     import urllib.request
-    from matcha.hifigan.models import Generator as HiFiGAN
-    from matcha.hifigan.config import v1
-    from matcha.hifigan.env import AttrDict
+    from hifigan.models import Generator as HiFiGAN
+    from hifigan.config import v1
+    from hifigan.env import AttrDict
 
     if not os.path.exists(VOCODER_PATH):
         print("Downloading Vocoder...")
