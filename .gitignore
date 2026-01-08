@@ -2,3 +2,9 @@ __pycache__
 *.ckpt
 *.wav
 generator*
+LJSpeech-1.1
+*.csv
+.bz2
+*yaml
+lightning_logs
+.venv

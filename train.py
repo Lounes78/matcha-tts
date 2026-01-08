@@ -1,120 +1,356 @@
-from typing import Any, Dict, List, Optional, Tuple
-
-import hydra
-import lightning as L
-# import rootutils # Disabling rootutils as we are running standalone
-from lightning import Callback, LightningDataModule, LightningModule, Trainer
-from lightning.pytorch.loggers import Logger
-from omegaconf import DictConfig
-
+import argparse
 import os
-# Manually set PROJECT_ROOT for Hydra configs
-# Assuming the root is one level up from this script (my_implementation)
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-os.environ["PROJECT_ROOT"] = project_root
+import sys
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import math
+import lightning as L
+from lightning.pytorch import LightningModule, Trainer
+from lightning.pytorch.callbacks import ModelCheckpoint
+from types import SimpleNamespace
+from torch.utils.data import DataLoader, Dataset
+from typing import Optional, List
+from pathlib import Path
 
-# Assuming we have a way to import utils if we copy them or adjust path
-# For now, we'll try to use relative import if possible or expect user to copy utils
+# Ensure we can import local modules
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(current_dir)
+
 try:
-    from matcha import utils
-except ImportError:
-    # If not found, one might need to adjust PYTHONPATH
-    import sys
-    import os
-    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-    from matcha import utils
+    from model import MatchaTTS
+    from hifigan.meldataset import mel_spectrogram, load_wav
+except ImportError as e:
+    print(f"Error importing modules: {e}")
+    print("Ensure model.py and hifigan/ are in the same directory.")
+    sys.exit(1)
 
-# rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True) # Skipped
+# -----------------------------------------------------------------------------
+# CONSTANTS & SYMBOLS (From main.py)
+# -----------------------------------------------------------------------------
+_pad = "_"
+_punctuation = ';:,.!?¡¿—…"«»“” '
+_letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+_letters_ipa = "ɑɐɒæɓʙβɔɕçɗɖðʤəɘɚɛɜɝɞɟʄɡɠɢʛɦɧħɥʜɨɪʝɭɬɫɮʟɱɯɰŋɳɲɴøɵɸθœɶʘɹɺɾɻʀʁɽʂʃʈʧʉʊʋⱱʌɣɤʍχʎʏʑʐʒʔʡʕʢǀǁǂǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘'̩'ᵻ"
+symbols = [_pad] + list(_punctuation) + list(_letters) + list(_letters_ipa)
+_symbol_to_id = {s: i for i, s in enumerate(symbols)}
 
-log = utils.get_pylogger(__name__)
 
+# -----------------------------------------------------------------------------
+# UTILS & ALIGNMENT (MAS)
+# -----------------------------------------------------------------------------
 
-@utils.task_wrapper
-def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Trains the model. Can additionally evaluate on a testset, using best weights obtained during
-    training.
-
-    This method is wrapped in optional @task_wrapper decorator, that controls the behavior during
-    failure. Useful for multiruns, saving info about the crash, etc.
-
-    :param cfg: A DictConfig configuration composed by Hydra.
-    :return: A tuple with metrics and dict with all instantiated objects.
+def maximum_path(value, mask):
     """
-    # set seed for random number generators in pytorch, numpy and python.random
-    if cfg.get("seed"):
-        L.seed_everything(cfg.seed, workers=True)
+    Monotonic Alignment Search (PyTorch Implementation)
+    value: [b, t_x, t_y]
+    mask: [b, t_x, t_y]
+    """
+    device = value.device
+    dtype = value.dtype
+    value = value * mask
+    
+    b, t_x, t_y = value.shape
+    direction = torch.zeros(b, t_x, t_y, dtype=torch.long, device=device)
+    v = torch.zeros(b, t_x, t_y, dtype=dtype, device=device)
+    
+    # Initialize
+    # Dynamic programming buffer
+    neg_inf = -1e9
+    
+    # (Simplified Viterbi for Monotonic Alignment)
+    # We want to find path from (0,0) to (t_x-1, t_y-1)
+    
+    v = torch.full_like(value, neg_inf)
+    v[:, 0, 0] = value[:, 0, 0]
+    
+    # Forward pass
+    for j in range(1, t_y):
+        for i in range(t_x):
+            src_v = v[:, i, j-1]
+            if i > 0:
+                src_prev = v[:, i-1, j-1]
+                # Compare src_v and src_prev
+                # We need to take max and store direction
+                # direction=0 : from same i (stay)
+                # direction=1 : from i-1 (move)
+                stack = torch.stack([src_v, src_prev], dim=-1)
+                best_val, best_idx = torch.max(stack, dim=-1)
+                v[:, i, j] = best_val + value[:, i, j]
+                direction[:, i, j] = best_idx
+            else:
+                v[:, i, j] = src_v + value[:, i, j]
+                direction[:, i, j] = 0 # Can only come from same i
+                
+    # Backward pass
+    text_len = mask.sum(dim=1)[:,0].long()
+    mel_len = mask.sum(dim=2)[:,0].long()
+    
+    path = torch.zeros(b, t_x, t_y, dtype=dtype, device=device)
+    
+    for k in range(b):
+        tx = text_len[k] - 1
+        ty = mel_len[k] - 1
+        
+        while ty >= 0 and tx >= 0:
+            path[k, tx, ty] = 1
+            if ty == 0:
+                break
+            if direction[k, tx, ty] == 1:
+                tx = max(0, tx - 1)
+            ty = max(0, ty - 1)
+            
+    return path
 
-    log.info(f"Instantiating datamodule <{cfg.data._target_}>")  # pylint: disable=protected-access
-    datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
 
-    log.info(f"Instantiating model <{cfg.model._target_}>")  # pylint: disable=protected-access
-    model: LightningModule = hydra.utils.instantiate(cfg.model)
+def sequence_mask(length, max_length=None):
+    if max_length is None:
+        max_length = length.max()
+    x = torch.arange(max_length, dtype=length.dtype, device=length.device)
+    return x.unsqueeze(0) < length.unsqueeze(1)
 
-    log.info("Instantiating callbacks...")
-    callbacks: List[Callback] = utils.instantiate_callbacks(cfg.get("callbacks"))
+# -----------------------------------------------------------------------------
+# MODULE WRAPPER
+# -----------------------------------------------------------------------------
 
-    log.info("Instantiating loggers...")
-    logger: List[Logger] = utils.instantiate_loggers(cfg.get("logger"))
+class MatchaLightning(LightningModule):
+    def __init__(self, model_params, learning_rate=1e-4):
+        super().__init__()
+        self.save_hyperparameters()
+        
+        # Initialize internal model
+        self.model = MatchaTTS(**model_params)
+        self.learning_rate = learning_rate
 
-    log.info(f"Instantiating trainer <{cfg.trainer._target_}>")  # pylint: disable=protected-access
-    trainer: Trainer = hydra.utils.instantiate(cfg.trainer, callbacks=callbacks, logger=logger)
+    def forward(self, x, x_lengths, y, y_lengths, spks=None):
+        return self.model(x, x_lengths, y, y_lengths, spks)
 
-    object_dict = {
-        "cfg": cfg,
-        "datamodule": datamodule,
-        "model": model,
-        "callbacks": callbacks,
-        "logger": logger,
-        "trainer": trainer,
+    def training_step(self, batch, batch_idx):
+        # Unpack batch
+        x, x_lengths, y, y_lengths = batch['text'], batch['text_lengths'], batch['mel'], batch['mel_lengths']
+        spks = batch.get('spks', None)
+        
+        # 1. Encoder Pass
+        # mu: [b, c, t_x]
+        # logw: [b, 1, t_x]
+        # x_mask: [b, 1, t_x]
+        mu, logw, x_mask = self.model.encoder(x, x_lengths, spks)
+        
+        # 2. Alignment / Duration
+        
+        with torch.no_grad():
+            # Create masks
+            y_max_length = y.shape[-1]
+            y_mask = sequence_mask(y_lengths, y_max_length).unsqueeze(1).to(y.device) # [b, 1, t_y]
+            attn_mask = x_mask.unsqueeze(-1) * y_mask.unsqueeze(2) # [b, 1, t_x, t_y]
+            
+            # Compute Log Prior (Log Likelihood of Gaussian with std=1)
+            # Logic copied from original Matcha-TTS (matcha/models/matcha_tts.py)
+            # log_prior = -0.5 * (y - mu)^2 + const
+            
+            const = -0.5 * math.log(2 * math.pi) * self.model.encoder.encoder_params.n_feats
+            factor = -0.5 * torch.ones(mu.shape, dtype=mu.dtype, device=mu.device)
+            
+            # y_square = -0.5 * y^2
+            y_square = torch.matmul(factor.transpose(1, 2), y**2)
+            
+            # y_mu_double = -0.5 * (-2 * mu * y) = mu * y
+            y_mu_double = torch.matmul(2.0 * (factor * mu).transpose(1, 2), y)
+            
+            # mu_square = -0.5 * mu^2
+            mu_square = torch.sum(factor * (mu**2), 1).unsqueeze(-1)
+            
+            # log_prior = -0.5*y^2 + mu*y - 0.5*mu^2 + const
+            #           = -0.5 * (y - mu)^2 + const
+            log_prior = y_square - y_mu_double + mu_square + const
+
+            # Apply Maximum Path
+            path = maximum_path(log_prior, attn_mask.squeeze(1)) # [b, t_x, t_y]
+
+        # 3. Use Path to get Duration Targets
+        # path sum over t_y gives duration for each t_x
+        # We assume path is not empty for any text token if lengths match reasonably
+        w_path = path.sum(dim=2) # [b, t_x]
+        
+        # Duration Loss
+        # logw is predicted log duration.
+        loss_duration = F.mse_loss(logw, torch.log(w_path.unsqueeze(1) + 1e-8), reduction='none')
+        loss_duration = (loss_duration * x_mask).sum() / x_mask.sum()
+        
+        # 4. Upsample mu using path for CFM
+        # path: [b, t_x, t_y]
+        # mu: [b, c, t_x]
+        # mu_y = mu * path
+        mu_y = torch.matmul(mu, path) # [b, c, t_x] * [b, t_x, t_y] -> [b, c, t_y]
+        
+        # 5. CFM Loss
+        # compute_loss calls estimator with mu_y (aligned)
+        
+        # Handle Speaker Embedding
+        if self.model.n_spks > 1 and spks is not None:
+            spks = self.model.spk_emb(spks)
+        else:
+            spks = None
+            
+        cfm_loss, _, _, _ = self.model.decoder.compute_loss(y, y_mask, mu_y, spks, cond=None)
+        
+        loss = cfm_loss + loss_duration
+        
+        self.log("train/loss", loss, prog_bar=True)
+        self.log("train/cfm_loss", cfm_loss)
+        self.log("train/dur_loss", loss_duration)
+        
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate, betas=(0.8, 0.99))
+        return optimizer
+
+# -----------------------------------------------------------------------------
+# DATASET
+# -----------------------------------------------------------------------------
+
+class LJSpeechDataset(Dataset):
+    def __init__(self, data_root):
+        self.data_root = Path(data_root)
+        self.wav_dir = self.data_root / "wavs"
+        self.metadata_path = self.data_root / "metadata.csv"
+        
+        if not self.metadata_path.exists():
+             raise FileNotFoundError(f"Metadata not found at {self.metadata_path}. Please download LJSpeech-1.1 and extract it.")
+        
+        with open(self.metadata_path, 'r', encoding='utf-8') as f:
+            self.metadata = [line.strip().split('|') for line in f]
+            
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx):
+        item = self.metadata[idx]
+        file_id = item[0]
+        # Index 2 is cleaner text, Index 1 is original
+        text_str = item[2] if len(item) > 2 else item[1]
+        
+        # Note: Add phonemizer here for better results
+        text_ints = [ _symbol_to_id.get(c, 0) for c in text_str ]
+        text = torch.LongTensor(text_ints)
+        
+        wav_path = self.wav_dir / f"{file_id}.wav"
+        if not wav_path.exists():
+             print(f"Warning: {wav_path} not found")
+             return self.__getitem__((idx + 1) % len(self))
+             
+        audio_data, sr = load_wav(str(wav_path))
+        if audio_data.dtype == np.int16:
+             audio_data = audio_data / 32768.0
+        audio = torch.from_numpy(audio_data).float().unsqueeze(0) 
+
+        # Mel Params
+        # n_fft=1024, num_mels=80, sr=22050, hop=256, win=1024, fmin=0, fmax=8000
+        mel = mel_spectrogram(audio, 1024, 80, 22050, 256, 1024, 0, 8000, center=False)
+        mel = mel.squeeze(0)
+        
+        spks = torch.tensor([0]).long()
+        
+        return {"text": text, "mel": mel, "spks": spks}
+
+def collate_fn(batch):
+    texts = [b['text'] for b in batch]
+    mels = [b['mel'] for b in batch]
+    spks = [b['spks'] for b in batch]
+    
+    text_lengths = torch.LongTensor([t.shape[0] for t in texts])
+    mel_lengths = torch.LongTensor([m.shape[1] for m in mels])
+    
+    # Pad
+    texts_padded = torch.nn.utils.rnn.pad_sequence(texts, batch_first=True, padding_value=0) # [B, T_x]
+    
+    # Mel: [C, T] -> transpose to [T, C] for pad_sequence -> transpose back
+    mels_permuted = [m.transpose(0, 1) for m in mels]
+    mels_padded = torch.nn.utils.rnn.pad_sequence(mels_permuted, batch_first=True, padding_value=0)
+    mels_padded = mels_padded.transpose(1, 2) # [B, C, T_y]
+    
+    spks_padded = torch.stack(spks) if spks[0] is not None else None
+    
+    return {
+        "text": texts_padded, 
+        "text_lengths": text_lengths,
+        "mel": mels_padded, 
+        "mel_lengths": mel_lengths,
+        "spks": spks_padded
     }
 
-    if logger:
-        log.info("Logging hyperparameters!")
-        utils.log_hyperparameters(object_dict)
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
 
-    if cfg.get("train"):
-        log.info("Starting training!")
-        trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
+def get_default_params():
+    # From MAIN.PY
+    encoder_params = SimpleNamespace(
+        encoder_type="roformer", n_feats=80, n_channels=192, filter_channels=768,
+        n_heads=2, n_layers=6, kernel_size=3, p_dropout=0.1, prenet=True
+    )
+    decoder_params = SimpleNamespace(
+        channels=(256, 256), num_res_blocks=2, num_transformer_blocks=1,
+        num_heads=2, time_emb_dim=256, time_mlp_dim=512, dropout=0.0, ffn_mult=4
+    )
+    cfm_params = {"solver": "euler", "sigma_min": 1e-4}
+    duration_predictor_params = SimpleNamespace(
+        filter_channels_dp=256, kernel_size=3, p_dropout=0.1
+    )
+    return {
+        "n_vocab": len(symbols),
+        "n_spks": 1,
+        "spk_emb_dim": 64,
+        "encoder_params": encoder_params,
+        "decoder_params": decoder_params,
+        "cfm_params": cfm_params,
+        "duration_predictor_params": duration_predictor_params
+    }
 
-    train_metrics = trainer.callback_metrics
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--gpus", type=int, default=1 if torch.cuda.is_available() else 0)
+    parser.add_argument("--data_root", type=str, default="LJSpeech-1.1", help="Path to LJSpeech dataset root")
+    args = parser.parse_args()
 
-    if cfg.get("test"):
-        log.info("Starting testing!")
-        ckpt_path = trainer.checkpoint_callback.best_model_path
-        if ckpt_path == "":
-            log.warning("Best ckpt not found! Using current weights for testing...")
-            ckpt_path = None
-        trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
-        log.info(f"Best ckpt path: {ckpt_path}")
+    # Params
+    params = get_default_params()
+    
+    # Model
+    model = MatchaLightning(params, learning_rate=args.lr)
+    
+    # Data
+    if not os.path.exists(args.data_root):
+        print(f"Data root {args.data_root} does not exist. Please download LJSpeech.")
+        return
 
-    test_metrics = trainer.callback_metrics
-
-    # merge train and test metrics
-    metric_dict = {**train_metrics, **test_metrics}
-
-    return metric_dict, object_dict
-
-
-@hydra.main(version_base="1.3", config_path="../configs", config_name="train.yaml")
-def main(cfg: DictConfig) -> Optional[float]:
-    """Main entry point for training.
-
-    :param cfg: DictConfig configuration composed by Hydra.
-    :return: Optional[float] with optimized metric value.
-    """
-    # apply extra utilities
-    # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
-    utils.extras(cfg)
-
-    # train the model
-    metric_dict, _ = train(cfg)
-
-    # safely retrieve metric value for hydra-based hyperparameter optimization
-    metric_value = utils.get_metric_value(metric_dict=metric_dict, metric_name=cfg.get("optimized_metric"))
-
-    # return optimized metric
-    return metric_value
-
+    train_dataset = LJSpeechDataset(args.data_root) 
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        collate_fn=collate_fn, 
+        shuffle=True, 
+        num_workers=4,
+        persistent_workers=True
+    )
+    
+    # Trainer
+    checkpoint_callback = ModelCheckpoint(monitor="train/loss", mode="min")
+    trainer = Trainer(
+        max_epochs=args.epochs,
+        accelerator="gpu" if args.gpus > 0 else "cpu",
+        devices=args.gpus if args.gpus > 0 else 1,
+        callbacks=[checkpoint_callback],
+        log_every_n_steps=5
+    )
+    
+    print("Starting training with DummyData (Please implement real Dataset loading)...")
+    trainer.fit(model, train_loader)
 
 if __name__ == "__main__":
-    main()  # pylint: disable=no-value-for-parameter
+    main()

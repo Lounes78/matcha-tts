@@ -461,6 +461,7 @@ class TextEncoder(nn.Module):
     ):
         super().__init__()
         self.encoder_type = encoder_type
+        self.encoder_params = encoder_params 
         self.n_vocab = n_vocab
         self.n_feats = encoder_params.n_feats
         self.n_channels = encoder_params.n_channels
@@ -1017,11 +1018,15 @@ class Decoder(nn.Module):
                 )
             x = rearrange(x, "b t c -> b c t")
 
-        for resnet, transformer_blocks, upsample in self.up_blocks:
+        for i, (resnet, transformer_blocks, upsample) in enumerate(self.up_blocks):
             mask_up = masks.pop()
             skip = hiddens.pop()
             
             # Pack/Concat x and skip
+            # Handle potential 1-px mismatches from previous block's upsampling (odd vs even lengths)
+            if x.shape[-1] != skip.shape[-1]:
+                x = F.interpolate(x, size=skip.shape[-1], mode="nearest")
+
             x = torch.cat([x, skip], dim=1)
             
             x = resnet(x, mask_up, t)
@@ -1180,6 +1185,9 @@ class MatchaTTS(nn.Module):
         self.n_spks = n_spks
         self.spk_emb_dim = spk_emb_dim
         
+        if n_spks > 1:
+            self.spk_emb = nn.Embedding(n_spks, spk_emb_dim)
+
         # Register buffers for mel_mean and mel_std to handle checkpoint loading
         self.register_buffer("mel_mean", torch.tensor(0.0))
         self.register_buffer("mel_std", torch.tensor(1.0))
@@ -1196,8 +1204,13 @@ class MatchaTTS(nn.Module):
 
         # 2. Initialize Decoder (The estimator)
         # Note: in_channels must be 2 * n_feats because we concatenate noisy mel (80) + conditional mel (80)
+        
+        decoder_in_channels = 2 * encoder_params.n_feats
+        if n_spks > 1:
+            decoder_in_channels += spk_emb_dim
+
         decoder_module = Decoder(
-            in_channels=2 * encoder_params.n_feats,
+            in_channels=decoder_in_channels,
             mu_channels=encoder_params.n_feats,
             out_channels=encoder_params.n_feats,
             channels=decoder_params.channels,
