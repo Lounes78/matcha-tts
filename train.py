@@ -291,9 +291,12 @@ def get_default_params():
         encoder_type="roformer", n_feats=80, n_channels=192, filter_channels=768,
         n_heads=2, n_layers=6, kernel_size=3, p_dropout=0.1, prenet=True
     )
+    # Decoder Params:
+    # channels=[256, 256], n_blocks=1 (transformer depth), num_mid_blocks=2, num_heads=2
+    # dropout=0.05 (matches config/model/decoder/default.yaml)
     decoder_params = SimpleNamespace(
         channels=(256, 256), num_res_blocks=2, num_transformer_blocks=1,
-        num_heads=2, time_emb_dim=256, time_mlp_dim=512, dropout=0.0, ffn_mult=4
+        num_heads=2, time_emb_dim=256, time_mlp_dim=512, dropout=0.05, ffn_mult=4
     )
     cfm_params = {"solver": "euler", "sigma_min": 1e-4}
     duration_predictor_params = SimpleNamespace(
