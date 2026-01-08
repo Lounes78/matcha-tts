@@ -15,7 +15,9 @@ from model import MatchaTTS
 # CONFIGURATION
 # ----------------------------------------------------------------------------------------------------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CHECKPOINT_PATH = "matcha_ljspeech.ckpt"
+# CHECKPOINT_PATH = "matcha_ljspeech.ckpt"
+CHECKPOINT_PATH = "lightning_logs/matcha_tts/version_0/checkpoints/epoch=17-step=936.ckpt"
+
 VOCODER_URL = "https://github.com/shivammehta25/Matcha-TTS-checkpoints/releases/download/v1.0/generator_v1"
 VOCODER_PATH = "generator_v1"
 
@@ -109,6 +111,18 @@ def load_custom_matcha(checkpoint_path, device):
     else:
         state_dict = checkpoint
 
+    # FIX: Prefix handling
+    # The checkpoint keys start with "model." because LightningModule wrapper has self.model
+    # But we are loading into the inner model directly.
+    # We need to strip "model." prefix from keys.
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("model."):
+            new_state_dict[k[6:]] = v # Remove "model."
+        else:
+            new_state_dict[k] = v
+    state_dict = new_state_dict
+
     # DEBUG: Check for mel_mean/std in state_dict
     if "mel_mean" in state_dict:
         print(f"Found mel_mean in checkpoint: shape {state_dict['mel_mean'].shape}")
@@ -154,6 +168,7 @@ def load_vocoder(device):
 def main():
     # A. Text Input
     text = "Hello! I am running on your custom model file."
+    text = "They printed very few books in this type, three only; but in their very first books in Rome, beginning with the year 1468,|They printed very few books in this type, three only; but in their very first books in Rome, beginning with the year fourteen sixty-eight,"
     print(f"Input Text: {text}")
 
     # B. Process Text

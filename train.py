@@ -122,14 +122,42 @@ class MatchaLightning(LightningModule):
         # Initialize internal model
         self.model = MatchaTTS(**model_params)
         self.learning_rate = learning_rate
+        
+        # Mel Params
+        self.n_fft = 1024
+        self.hop_length = 256
+        self.win_length = 1024
+        self.n_mels = 80
+        self.fmin = 0
+        self.fmax = 8000
+        self.sampling_rate = 22050
 
     def forward(self, x, x_lengths, y, y_lengths, spks=None):
         return self.model(x, x_lengths, y, y_lengths, spks)
 
     def training_step(self, batch, batch_idx):
         # Unpack batch
-        x, x_lengths, y, y_lengths = batch['text'], batch['text_lengths'], batch['mel'], batch['mel_lengths']
+        x, x_lengths = batch['text'], batch['text_lengths']
         spks = batch.get('spks', None)
+        
+        # Generate Mel on GPU
+        audio = batch['audio'] 
+        
+        # Audio is [B, T]. mel_spectrogram expects [B, T]
+        y = mel_spectrogram(
+            audio, 
+            self.n_fft, 
+            self.n_mels, 
+            self.sampling_rate, 
+            self.hop_length, 
+            self.win_length, 
+            self.fmin, 
+            self.fmax, 
+            center=False
+        ) # [B, n_mels, T_mel]
+        
+        y_lengths = (batch['audio_lengths'] // self.hop_length).long() 
+        
         
         # 1. Encoder Pass
         # mu: [b, c, t_x]
@@ -216,6 +244,17 @@ class LJSpeechDataset(Dataset):
         self.data_root = Path(data_root)
         self.wav_dir = self.data_root / "wavs"
         self.metadata_path = self.data_root / "metadata.csv"
+
+        # Init Phonemizer
+        try:
+            import phonemizer
+            self.global_phonemizer = phonemizer.backend.EspeakBackend(
+                language='en-us', preserve_punctuation=True, with_stress=True
+            )
+            print("Phonemizer loaded successfully.")
+        except Exception as e:
+            print(f"Warning: Could not load phonemizer: {e}")
+            self.global_phonemizer = None
         
         if not self.metadata_path.exists():
              raise FileNotFoundError(f"Metadata not found at {self.metadata_path}. Please download LJSpeech-1.1 and extract it.")
@@ -232,8 +271,17 @@ class LJSpeechDataset(Dataset):
         # Index 2 is cleaner text, Index 1 is original
         text_str = item[2] if len(item) > 2 else item[1]
         
-        # Note: Add phonemizer here for better results
-        text_ints = [ _symbol_to_id.get(c, 0) for c in text_str ]
+        # Phonemize on-the-fly
+        if self.global_phonemizer:
+            try:
+                phonemized_text = self.global_phonemizer.phonemize([text_str], strip=True)[0]
+                text_ints = [ _symbol_to_id.get(c, 0) for c in phonemized_text ]
+            except Exception as e:
+                print(f"Error: Phonemization failed for '{text_str}': {e}. Retrying with next sample...")
+                return self.__getitem__((idx + 1) % len(self))
+        else:
+             text_ints = [ _symbol_to_id.get(c, 0) for c in text_str ]
+
         text = torch.LongTensor(text_ints)
         
         wav_path = self.wav_dir / f"{file_id}.wav"
@@ -244,40 +292,33 @@ class LJSpeechDataset(Dataset):
         audio_data, sr = load_wav(str(wav_path))
         if audio_data.dtype == np.int16:
              audio_data = audio_data / 32768.0
-        audio = torch.from_numpy(audio_data).float().unsqueeze(0) 
+        audio = torch.from_numpy(audio_data).float() # [T_audio] (1D)
 
-        # Mel Params
-        # n_fft=1024, num_mels=80, sr=22050, hop=256, win=1024, fmin=0, fmax=8000
-        mel = mel_spectrogram(audio, 1024, 80, 22050, 256, 1024, 0, 8000, center=False)
-        mel = mel.squeeze(0)
-        
         spks = torch.tensor([0]).long()
         
-        return {"text": text, "mel": mel, "spks": spks}
+        return {"text": text, "audio": audio, "spks": spks}
 
 def collate_fn(batch):
     texts = [b['text'] for b in batch]
-    mels = [b['mel'] for b in batch]
+    audios = [b['audio'] for b in batch]
     spks = [b['spks'] for b in batch]
     
     text_lengths = torch.LongTensor([t.shape[0] for t in texts])
-    mel_lengths = torch.LongTensor([m.shape[1] for m in mels])
+    audio_lengths = torch.LongTensor([a.shape[0] for a in audios])
     
-    # Pad
+    # Pad Text
     texts_padded = torch.nn.utils.rnn.pad_sequence(texts, batch_first=True, padding_value=0) # [B, T_x]
     
-    # Mel: [C, T] -> transpose to [T, C] for pad_sequence -> transpose back
-    mels_permuted = [m.transpose(0, 1) for m in mels]
-    mels_padded = torch.nn.utils.rnn.pad_sequence(mels_permuted, batch_first=True, padding_value=0)
-    mels_padded = mels_padded.transpose(1, 2) # [B, C, T_y]
+    # Pad Audio
+    audios_padded = torch.nn.utils.rnn.pad_sequence(audios, batch_first=True, padding_value=0) # [B, T_audio]
     
     spks_padded = torch.stack(spks) if spks[0] is not None else None
     
     return {
         "text": texts_padded, 
         "text_lengths": text_lengths,
-        "mel": mels_padded, 
-        "mel_lengths": mel_lengths,
+        "audio": audios_padded, 
+        "audio_lengths": audio_lengths,
         "spks": spks_padded
     }
 
@@ -354,7 +395,13 @@ def main():
     from lightning.pytorch.loggers import TensorBoardLogger
     logger = TensorBoardLogger("lightning_logs", name="matcha_tts")
     
-    checkpoint_callback = ModelCheckpoint(monitor="train/loss", mode="min")
+    checkpoint_callback = ModelCheckpoint(
+        monitor="train/loss", 
+        mode="min", 
+        every_n_epochs=3,
+        save_top_k=-1, # Keep all checkpoints saved every 3 epochs
+        filename="matcha-epoch{epoch:02d}-loss{train/loss:.2f}"
+    )
     trainer = Trainer(
         max_epochs=args.epochs,
         accelerator="gpu" if args.gpus > 0 else "cpu",
