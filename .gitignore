@@ -1,10 +1,29 @@
-__pycache__
-*.ckpt
+# Python / Environment
+__pycache__/
+*.py[cod]
+.venv/
+.env
+
+# Logs and Outputs
+lightning_logs/
 *.wav
+*.png
+*.jpg
+
+# Checkpoints and Models
+*.ckpt
+*.pt
+*.pth
+
+# Dataset
+LJSpeech-1.1/
+*.tar.bz2
+*.tar.gz
+*.zip
+
+# Generated artifacts
 generator*
-LJSpeech-1.1
-*.csv
-.bz2
-*yaml
-lightning_logs
-.venv
+
+# Misc
+.DS_Store
+.vscode/

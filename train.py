@@ -314,8 +314,9 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--gpus", type=int, default=1 if torch.cuda.is_available() else 0)
+    parser.add_argument("--gpus", type=int, default=torch.cuda.device_count() if torch.cuda.is_available() else 0)
     parser.add_argument("--data_root", type=str, default="LJSpeech-1.1", help="Path to LJSpeech dataset root")
+    parser.add_argument("--precision", type=str, default="16-mixed", help="Training precision (16-mixed, 32, etc)")
     args = parser.parse_args()
 
     # Params
@@ -329,27 +330,40 @@ def main():
         print(f"Data root {args.data_root} does not exist. Please download LJSpeech.")
         return
 
+    # Effective batch size scaling
+    batch_size = args.batch_size
     train_dataset = LJSpeechDataset(args.data_root) 
+    
+    # Auto-adjust workers: 4 GPUs -> likely powerful CPU. Use 16 workers.
+    num_workers = 16 
+    
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=args.batch_size, 
+        batch_size=batch_size, 
         collate_fn=collate_fn, 
         shuffle=True, 
-        num_workers=4,
-        persistent_workers=True
+        num_workers=num_workers,
+        persistent_workers=True,
+        pin_memory=True
     )
     
     # Trainer
+    from lightning.pytorch.loggers import TensorBoardLogger
+    logger = TensorBoardLogger("lightning_logs", name="matcha_tts")
+    
     checkpoint_callback = ModelCheckpoint(monitor="train/loss", mode="min")
     trainer = Trainer(
         max_epochs=args.epochs,
         accelerator="gpu" if args.gpus > 0 else "cpu",
         devices=args.gpus if args.gpus > 0 else 1,
+        strategy="ddp" if args.gpus > 1 else "auto",
+        precision=args.precision,
         callbacks=[checkpoint_callback],
+        logger=logger,
         log_every_n_steps=5
     )
     
-    print("Starting training with DummyData (Please implement real Dataset loading)...")
+    print(f"Starting training on {args.gpus} GPUs with precision {args.precision}...")
     trainer.fit(model, train_loader)
 
 if __name__ == "__main__":

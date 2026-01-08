@@ -30,18 +30,18 @@ symbols = [_pad] + list(_punctuation) + list(_letters) + list(_letters_ipa)
 _symbol_to_id = {s: i for i, s in enumerate(symbols)}
 
 def get_phonemized_text(text):
-    return "hˈeɪ, ðˈɪs ɪz ə tˈɛst wɪð ˈaʊɚ stˈændəˌloʊn fˈaɪl ˌɪmplɪmɛntˈeɪʃən !"
-    # try:
-    #     import phonemizer
-    #     # Use espeak-ng backend
-    #     global_phonemizer = phonemizer.backend.EspeakBackend(
-    #         language='en-us', preserve_punctuation=True, with_stress=True
-    #     )
-    #     return global_phonemizer.phonemize([text], strip=True)[0]
-    # except ImportError:
-    #     print("Phonemizer not installed or espeak-ng missing. Using default phonemes.")
-    #     # Fallback for testing without phonemizer
-    #     return "heɪ, aɪ æm mætʃə ə tɛkst tu spitʃ..."
+    # return "hˈeɪ, ðˈɪs ɪz ə tˈɛst wɪð ˈaʊɚ stˈændəˌloʊn fˈaɪl ˌɪmplɪmɛntˈeɪʃən !"
+    try:
+        import phonemizer
+        # Use espeak-ng backend
+        global_phonemizer = phonemizer.backend.EspeakBackend(
+            language='en-us', preserve_punctuation=True, with_stress=True
+        )
+        return global_phonemizer.phonemize([text], strip=True)[0]
+    except ImportError:
+        print("Phonemizer not installed or espeak-ng missing. Using default phonemes.")
+        # Fallback for testing without phonemizer
+        return "heɪ, aɪ æm mætʃə ə tɛkst tu spitʃ..."
 
 def phonemes_to_sequence(phonemized_text):
     sequence = []
