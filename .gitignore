@@ -21,7 +21,7 @@ LJSpeech-1.1/
 *.tar.gz
 *.zip
 
-# Generated artifacts
+# artifacts
 generator*
 
 # Misc
