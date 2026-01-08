@@ -1,0 +1,15 @@
+torch
+typeguard
+soundfile
+numpy
+scipy
+cython
+librosa
+matplotlib
+numba
+pyyaml
+tqdm
+einops
+diffusers
+phonemizer
+transformers
