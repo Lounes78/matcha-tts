@@ -41,6 +41,18 @@ _symbol_to_id = {s: i for i, s in enumerate(symbols)}
 # UTILS & ALIGNMENT (MAS)
 # -----------------------------------------------------------------------------
 
+def intersperse(lst, item):
+    result = [item] * (len(lst) * 2 + 1)
+    result[1::2] = lst
+    return result
+
+def fix_len_compatibility(length, num_downsamplings_in_unet=2):
+    factor = 2 ** num_downsamplings_in_unet
+    # Round up to nearest multiple of factor
+    if isinstance(length, torch.Tensor):
+        return ((length + factor - 1) // factor) * factor
+    return int(math.ceil(length / factor) * factor)
+
 def maximum_path(value, mask):
     """
     Monotonic Alignment Search (PyTorch Implementation)
@@ -131,6 +143,15 @@ class MatchaLightning(LightningModule):
         self.fmin = 0
         self.fmax = 8000
         self.sampling_rate = 22050
+        
+        # Normalization Stats (LJSpeech)
+        # These are crucial for Flow Matching to work well from N(0,1) prior
+        self.register_buffer("mel_mean", torch.tensor(-5.5366))
+        self.register_buffer("mel_std", torch.tensor(2.1161))
+        
+        # Update model buffers so they are saved in checkpoint
+        self.model.mel_mean = self.mel_mean
+        self.model.mel_std = self.mel_std
 
     def forward(self, x, x_lengths, y, y_lengths, spks=None):
         return self.model(x, x_lengths, y, y_lengths, spks)
@@ -155,6 +176,9 @@ class MatchaLightning(LightningModule):
             self.fmax, 
             center=False
         ) # [B, n_mels, T_mel]
+        
+        # Normalize Mel!
+        y = (torch.log(torch.clamp(y, min=1e-5)) - self.mel_mean) / self.mel_std
         
         y_lengths = (batch['audio_lengths'] // self.hop_length).long() 
         
@@ -281,6 +305,10 @@ class LJSpeechDataset(Dataset):
                 return self.__getitem__((idx + 1) % len(self))
         else:
              text_ints = [ _symbol_to_id.get(c, 0) for c in text_str ]
+        
+        # Apply intersperse (add blank token 0 between symbols)
+        # 0 corresponds to '_' which is the blank/pad token in our symbols list
+        text_ints = intersperse(text_ints, 0)
 
         text = torch.LongTensor(text_ints)
         
@@ -310,6 +338,8 @@ def collate_fn(batch):
     texts_padded = torch.nn.utils.rnn.pad_sequence(texts, batch_first=True, padding_value=0) # [B, T_x]
     
     # Pad Audio
+    # We should ensure audio length will produce mel length compatible with U-Net downsamplings
+    # Though standard pad is fine, we handle mel length masking in model.
     audios_padded = torch.nn.utils.rnn.pad_sequence(audios, batch_first=True, padding_value=0) # [B, T_audio]
     
     spks_padded = torch.stack(spks) if spks[0] is not None else None
