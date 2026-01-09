@@ -234,7 +234,18 @@ class MatchaLightning(LightningModule):
         # path: [b, t_x, t_y]
         # mu: [b, c, t_x]
         # mu_y = mu * path
-        mu_y = torch.matmul(mu, path) # [b, c, t_x] * [b, t_x, t_y] -> [b, c, t_y]
+        # Checkpoint 1: Verified against original implementation using transposes explicitely
+        # mu_y = torch.matmul(attn.squeeze(1).transpose(1, 2), mu_x.transpose(1, 2)).transpose(1, 2)
+        # Note: 'path' here is 'attn' in original code but squeeze not needed as it is [b,tx,ty] not [b,1,tx,ty] like orig attn
+        # Our path is [b, t_x, t_y]
+        # mu is [b, c, t_x]
+        # User requested: mu_y = torch.matmul(path.transpose(1, 2), mu.transpose(1, 2)).transpose(1, 2)
+        # path.T(1,2) -> [b, ty, tx]
+        # mu.T(1,2)   -> [b, tx, c]
+        # matmul      -> [b, ty, c]
+        # .T(1,2)     -> [b, c, ty]
+        # This is mathematically equivalent to mu @ path, but we apply the exact requested form for correctness verification.
+        mu_y = torch.matmul(path.transpose(1, 2), mu.transpose(1, 2)).transpose(1, 2)
         
         # 5. CFM Loss
         # compute_loss calls estimator with mu_y (aligned)
@@ -245,7 +256,10 @@ class MatchaLightning(LightningModule):
         else:
             spks = None
             
-        cfm_loss, _, _, _ = self.model.decoder.compute_loss(y, y_mask, mu_y, spks, cond=None)
+        # Checkpoint 2: CFM Loss returns 4 values in original component code (loss, y_t, pred, u_t)
+        # But we only need loss.
+        # Verified from models/components/flow_matching.py : compute_loss returns loss, y_t, pred, u_t
+        cfm_loss, _, _, _ = self.model.decoder.compute_loss(x1=y, mask=y_mask, mu=mu_y, spks=spks, cond=None)
         
         # 6. Prior Loss (Added matching original implementation)
         # prior_loss = torch.sum(0.5 * ((y - mu_y) ** 2 + math.log(2 * math.pi)) * y_mask)
@@ -264,7 +278,10 @@ class MatchaLightning(LightningModule):
         return loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate, betas=(0.8, 0.99))
+        # Checkpoint 3: Optimizer
+        # Original config configs/model/optimizer/adam.yaml specifies torch.optim.Adam (not AdamW)
+        # weight_decay is 0.0 default
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
         return optimizer
 
 # -----------------------------------------------------------------------------
@@ -272,27 +289,62 @@ class MatchaLightning(LightningModule):
 # -----------------------------------------------------------------------------
 
 class LJSpeechDataset(Dataset):
-    def __init__(self, data_root):
+    def __init__(self, data_root, cache_in_memory=True):
         self.data_root = Path(data_root)
         self.wav_dir = self.data_root / "wavs"
         self.metadata_path = self.data_root / "metadata.csv"
+        self.phonemes_path = self.data_root / "metadata_phonemes.csv"
+        self.cache_in_memory = cache_in_memory
+        self.audio_cache = {}
 
-        # Init Phonemizer
-        try:
-            import phonemizer
-            self.global_phonemizer = phonemizer.backend.EspeakBackend(
-                language='en-us', preserve_punctuation=True, with_stress=True
-            )
-            print("Phonemizer loaded successfully.")
-        except Exception as e:
-            print(f"Warning: Could not load phonemizer: {e}")
+        # 1. Try Loading Pre-computed Phonemes
+        self.precomputed_phonemes = {}
+        if self.phonemes_path.exists():
+            print(f"Loading pre-computed phonemes from {self.phonemes_path}...")
+            with open(self.phonemes_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split("|")
+                    if len(parts) >= 2:
+                        self.precomputed_phonemes[parts[0]] = parts[1]
             self.global_phonemizer = None
+            print(f"Loaded {len(self.precomputed_phonemes)} phonemized entries.")
+        else:
+            # Fallback to on-the-fly
+            print("Pre-computed phonemes not found. Using on-the-fly phonemization (Slower).")
+            try:
+                import phonemizer
+                self.global_phonemizer = phonemizer.backend.EspeakBackend(
+                    language='en-us', preserve_punctuation=True, with_stress=True
+                )
+            except Exception as e:
+                print(f"Warning: Could not load phonemizer: {e}")
+                self.global_phonemizer = None
         
         if not self.metadata_path.exists():
-             raise FileNotFoundError(f"Metadata not found at {self.metadata_path}. Please download LJSpeech-1.1 and extract it.")
+             raise FileNotFoundError(f"Metadata not found at {self.metadata_path}.")
         
         with open(self.metadata_path, 'r', encoding='utf-8') as f:
             self.metadata = [line.strip().split('|') for line in f]
+
+        # 2. Pre-load Audio into RAM
+        if self.cache_in_memory:
+            print("Caching audio files into RAM (this speeds up training)...")
+            from tqdm import tqdm
+            # Filter metadata to existing files only to be safe
+            valid_metadata = []
+            for item in tqdm(self.metadata):
+                file_id = item[0]
+                wav_path = self.wav_dir / f"{file_id}.wav"
+                if wav_path.exists():
+                    audio_data, sr = load_wav(str(wav_path))
+                    # Normalize float32
+                    if audio_data.dtype == np.int16:
+                        audio_data = audio_data / 32768.0
+                    self.audio_cache[file_id] = audio_data
+                    valid_metadata.append(item)
+            self.metadata = valid_metadata
+            print(f"Cached {len(self.audio_cache)} audio files.")
+
             
     def __len__(self):
         return len(self.metadata)
@@ -300,35 +352,41 @@ class LJSpeechDataset(Dataset):
     def __getitem__(self, idx):
         item = self.metadata[idx]
         file_id = item[0]
-        # Index 2 is cleaner text, Index 1 is original
-        text_str = item[2] if len(item) > 2 else item[1]
         
-        # Phonemize on-the-fly
-        if self.global_phonemizer:
-            try:
-                phonemized_text = self.global_phonemizer.phonemize([text_str], strip=True)[0]
-                text_ints = [ _symbol_to_id.get(c, 0) for c in phonemized_text ]
-            except Exception as e:
-                print(f"Error: Phonemization failed for '{text_str}': {e}. Retrying with next sample...")
-                return self.__getitem__((idx + 1) % len(self))
+        # A. Text Processing
+        if file_id in self.precomputed_phonemes:
+            # Use pre-computed
+            phonemes = self.precomputed_phonemes[file_id]
+            text_ints = [ _symbol_to_id.get(c, 0) for c in phonemes ]
         else:
-             text_ints = [ _symbol_to_id.get(c, 0) for c in text_str ]
-        
-        # Apply intersperse (add blank token 0 between symbols)
-        # 0 corresponds to '_' which is the blank/pad token in our symbols list
-        text_ints = intersperse(text_ints, 0)
+            # Fallback
+            text_str = item[2] if len(item) > 2 else item[1]
+            if self.global_phonemizer:
+                try:
+                    phonemized_text = self.global_phonemizer.phonemize([text_str], strip=True)[0]
+                    text_ints = [ _symbol_to_id.get(c, 0) for c in phonemized_text ]
+                except Exception:
+                    text_ints = [ _symbol_to_id.get(c, 0) for c in text_str ]
+            else:
+                 text_ints = [ _symbol_to_id.get(c, 0) for c in text_str ]
 
+        # Apply intersperse
+        text_ints = intersperse(text_ints, 0)
         text = torch.LongTensor(text_ints)
         
-        wav_path = self.wav_dir / f"{file_id}.wav"
-        if not wav_path.exists():
-             print(f"Warning: {wav_path} not found")
-             return self.__getitem__((idx + 1) % len(self))
-             
-        audio_data, sr = load_wav(str(wav_path))
-        if audio_data.dtype == np.int16:
-             audio_data = audio_data / 32768.0
+        # B. Audio Loading
+        if self.cache_in_memory and file_id in self.audio_cache:
+            audio_data = self.audio_cache[file_id]
+        else:
+            wav_path = self.wav_dir / f"{file_id}.wav"
+            if not wav_path.exists():
+                 return self.__getitem__((idx + 1) % len(self))
+            audio_data, sr = load_wav(str(wav_path))
+            if audio_data.dtype == np.int16:
+                 audio_data = audio_data / 32768.0
+                 
         audio = torch.from_numpy(audio_data).float() # [T_audio] (1D)
+
 
         spks = torch.tensor([0]).long()
         
@@ -366,8 +424,10 @@ def collate_fn(batch):
 
 def get_default_params():
     # From MAIN.PY
+    # Checkpoint 5: Encoder type verified from configs/model/encoder/default.yaml ("RoPE Encoder")
+    # This must match string check in TextEncoder class
     encoder_params = SimpleNamespace(
-        encoder_type="roformer", n_feats=80, n_channels=192, filter_channels=768,
+        encoder_type="RoPE Encoder", n_feats=80, n_channels=192, filter_channels=768,
         n_heads=2, n_layers=6, kernel_size=3, p_dropout=0.1, prenet=True
     )
     # Decoder Params:
@@ -421,7 +481,9 @@ def main():
     train_dataset = LJSpeechDataset(args.data_root) 
     
     # Auto-adjust workers: 4 GPUs -> likely powerful CPU. Use 16 workers.
-    num_workers = 16 
+    # Since we use RAM caching, workers don't need to do disk I/O, just tensor conversion.
+    # We can reduce workers slightly to reduce CPU contest if caching is on.
+    num_workers = 8 
     
     train_loader = DataLoader(
         train_dataset, 
@@ -450,6 +512,7 @@ def main():
         devices=args.gpus if args.gpus > 0 else 1,
         strategy="ddp" if args.gpus > 1 else "auto",
         precision=args.precision,
+        gradient_clip_val=5.0, # Checkpoint 4: Added gradient clipping verified from config/trainer/default.yaml
         callbacks=[checkpoint_callback],
         logger=logger,
         log_every_n_steps=5
