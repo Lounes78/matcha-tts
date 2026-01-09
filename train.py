@@ -53,9 +53,56 @@ def fix_len_compatibility(length, num_downsamplings_in_unet=2):
         return ((length + factor - 1) // factor) * factor
     return int(math.ceil(length / factor) * factor)
 
+try:
+    import numba
+    from numba import njit, prange
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    print("Warning: numba not installed. MAS will be slow. Install with: pip install numba")
+
+if NUMBA_AVAILABLE:
+    @njit(parallel=True)
+    def _maximum_path_numba(paths, values, t_x_max, t_y_max):
+        """Numba-optimized MAS matching Cython implementation."""
+        b = values.shape[0]
+        neg_inf = -1e9
+        
+        for k in prange(b):
+            tx = t_x_max[k]
+            ty = t_y_max[k]
+            
+            # Forward pass
+            for y in range(ty):
+                x_start = max(0, tx + y - ty)
+                x_end = min(tx, y + 1)
+                
+                for x in range(x_start, x_end):
+                    if x == y:
+                        v_cur = neg_inf
+                    else:
+                        v_cur = values[k, x, y-1] if y > 0 else neg_inf
+                    
+                    if x == 0:
+                        v_prev = 0.0 if y == 0 else neg_inf
+                    else:
+                        v_prev = values[k, x-1, y-1] if y > 0 else neg_inf
+                    
+                    values[k, x, y] = max(v_cur, v_prev) + values[k, x, y]
+            
+            # Backward pass
+            index = tx - 1
+            for y in range(ty - 1, -1, -1):
+                paths[k, index, y] = 1
+                if index != 0 and (index == y or values[k, index, y-1] < values[k, index-1, y-1]):
+                    index = index - 1
+
+
 def maximum_path(value, mask):
     """
-    Monotonic Alignment Search (PyTorch Implementation)
+    Monotonic Alignment Search.
+    Uses Numba JIT if available (fast), otherwise falls back to pure Python (slow).
+    
     value: [b, t_x, t_y]
     mask: [b, t_x, t_y]
     """
@@ -64,56 +111,49 @@ def maximum_path(value, mask):
     value = value * mask
     
     b, t_x, t_y = value.shape
-    direction = torch.zeros(b, t_x, t_y, dtype=torch.long, device=device)
-    v = torch.zeros(b, t_x, t_y, dtype=dtype, device=device)
     
-    # Initialize
-    # Dynamic programming buffer
-    neg_inf = -1e9
+    # Get actual lengths from mask
+    t_x_max = mask.sum(dim=1)[:, 0].long()
+    t_y_max = mask.sum(dim=2)[:, 0].long()
     
-    # (Simplified Viterbi for Monotonic Alignment)
-    # We want to find path from (0,0) to (t_x-1, t_y-1)
-    
-    v = torch.full_like(value, neg_inf)
-    v[:, 0, 0] = value[:, 0, 0]
-    
-    # Forward pass
-    for j in range(1, t_y):
-        for i in range(t_x):
-            src_v = v[:, i, j-1]
-            if i > 0:
-                src_prev = v[:, i-1, j-1]
-                # Compare src_v and src_prev
-                # We need to take max and store direction
-                # direction=0 : from same i (stay)
-                # direction=1 : from i-1 (move)
-                stack = torch.stack([src_v, src_prev], dim=-1)
-                best_val, best_idx = torch.max(stack, dim=-1)
-                v[:, i, j] = best_val + value[:, i, j]
-                direction[:, i, j] = best_idx
-            else:
-                v[:, i, j] = src_v + value[:, i, j]
-                direction[:, i, j] = 0 # Can only come from same i
-                
-    # Backward pass
-    text_len = mask.sum(dim=1)[:,0].long()
-    mel_len = mask.sum(dim=2)[:,0].long()
-    
-    path = torch.zeros(b, t_x, t_y, dtype=dtype, device=device)
-    
-    for k in range(b):
-        tx = text_len[k] - 1
-        ty = mel_len[k] - 1
+    if NUMBA_AVAILABLE:
+        # Fast path: use numba
+        values_np = value.cpu().numpy().astype(np.float32)
+        paths_np = np.zeros_like(values_np, dtype=np.int32)
+        t_x_np = t_x_max.cpu().numpy().astype(np.int32)
+        t_y_np = t_y_max.cpu().numpy().astype(np.int32)
         
-        while ty >= 0 and tx >= 0:
-            path[k, tx, ty] = 1
-            if ty == 0:
-                break
-            if direction[k, tx, ty] == 1:
-                tx = max(0, tx - 1)
-            ty = max(0, ty - 1)
-            
-    return path
+        _maximum_path_numba(paths_np, values_np, t_x_np, t_y_np)
+        
+        return torch.from_numpy(paths_np).to(device=device, dtype=dtype)
+    else:
+        # Slow fallback: pure Python
+        neg_inf = -1e9
+        path = torch.zeros(b, t_x, t_y, dtype=dtype, device=device)
+        v = value.clone()
+        
+        for y in range(t_y):
+            if y == 0:
+                v[:, 1:, 0] = neg_inf
+            else:
+                v_cur = v[:, :, y-1].clone()
+                if y < t_x:
+                    v_cur[:, y] = neg_inf
+                v_prev = torch.full((b, t_x), neg_inf, device=device, dtype=dtype)
+                v_prev[:, 1:] = v[:, :-1, y-1]
+                v[:, :, y] = torch.maximum(v_cur, v_prev) + value[:, :, y]
+        
+        for k in range(b):
+            tx, ty = t_x_max[k].item(), t_y_max[k].item()
+            if tx <= 0 or ty <= 0:
+                continue
+            index = tx - 1
+            for y in range(ty - 1, -1, -1):
+                path[k, index, y] = 1.0
+                if index != 0 and y > 0:
+                    if index == y or v[k, index, y-1] < v[k, index-1, y-1]:
+                        index = index - 1
+        return path
 
 
 def sequence_mask(length, max_length=None):
@@ -161,6 +201,12 @@ class MatchaLightning(LightningModule):
         x, x_lengths = batch['text'], batch['text_lengths']
         spks = batch.get('spks', None)
         
+        # Handle Speaker Embedding BEFORE encoder (important: encoder uses spk embedding!)
+        if self.model.n_spks > 1 and spks is not None:
+            spks = self.model.spk_emb(spks)
+        else:
+            spks = None
+        
         # Generate Mel on GPU
         audio = batch['audio'] 
         
@@ -194,8 +240,8 @@ class MatchaLightning(LightningModule):
         with torch.no_grad():
             # Create masks
             y_max_length = y.shape[-1]
-            y_mask = sequence_mask(y_lengths, y_max_length).unsqueeze(1).to(y.device) # [b, 1, t_y]
-            attn_mask = x_mask.unsqueeze(-1) * y_mask.unsqueeze(2) # [b, 1, t_x, t_y]
+            y_mask = sequence_mask(y_lengths, y_max_length).unsqueeze(1).to(x_mask)  # [b, 1, t_y] - same dtype as x_mask!
+            attn_mask = x_mask.unsqueeze(-1) * y_mask.unsqueeze(2)  # [b, 1, t_x, t_y]
             
             # Compute Log Prior (Log Likelihood of Gaussian with std=1)
             # Logic copied from original Matcha-TTS (matcha/models/matcha_tts.py)
@@ -223,12 +269,12 @@ class MatchaLightning(LightningModule):
         # 3. Use Path to get Duration Targets
         # path sum over t_y gives duration for each t_x
         # We assume path is not empty for any text token if lengths match reasonably
-        w_path = path.sum(dim=2) # [b, t_x]
+        # Original: logw_ = torch.log(1e-8 + torch.sum(attn.unsqueeze(1), -1)) * x_mask
+        # path is [b, t_x, t_y], sum over t_y -> [b, t_x], unsqueeze -> [b, 1, t_x]
+        logw_ = torch.log(1e-8 + path.sum(dim=2).unsqueeze(1)) * x_mask
         
-        # Duration Loss
-        # logw is predicted log duration.
-        loss_duration = F.mse_loss(logw, torch.log(w_path.unsqueeze(1) + 1e-8), reduction='none')
-        loss_duration = (loss_duration * x_mask).sum() / x_mask.sum()
+        # Duration Loss (original uses: torch.sum((logw - logw_) ** 2) / torch.sum(lengths))
+        loss_duration = torch.sum((logw - logw_) ** 2) / torch.sum(x_lengths)
         
         # 4. Upsample mu using path for CFM
         # path: [b, t_x, t_y]
@@ -249,16 +295,9 @@ class MatchaLightning(LightningModule):
         
         # 5. CFM Loss
         # compute_loss calls estimator with mu_y (aligned)
-        
-        # Handle Speaker Embedding
-        if self.model.n_spks > 1 and spks is not None:
-            spks = self.model.spk_emb(spks)
-        else:
-            spks = None
+        # Speaker embedding already computed at the start of training_step
             
-        # Checkpoint 2: CFM Loss returns 4 values in original component code (loss, y_t, pred, u_t)
-        # But we only need loss.
-        # Verified from models/components/flow_matching.py : compute_loss returns loss, y_t, pred, u_t
+        # compute_loss returns (loss, y_t, pred, u_t) - we only need loss
         cfm_loss, _, _, _ = self.model.decoder.compute_loss(x1=y, mask=y_mask, mu=mu_y, spks=spks, cond=None)
         
         # 6. Prior Loss (Added matching original implementation)
@@ -274,6 +313,58 @@ class MatchaLightning(LightningModule):
         self.log("train/cfm_loss", cfm_loss)
         self.log("train/dur_loss", loss_duration)
         self.log("train/prior_loss", prior_loss)
+        
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        # Same as training_step but with val/ prefix for logging
+        x, x_lengths = batch['text'], batch['text_lengths']
+        spks = batch.get('spks', None)
+        
+        if self.model.n_spks > 1 and spks is not None:
+            spks = self.model.spk_emb(spks)
+        else:
+            spks = None
+        
+        audio = batch['audio']
+        y = mel_spectrogram(
+            audio, self.n_fft, self.n_mels, self.sampling_rate,
+            self.hop_length, self.win_length, self.fmin, self.fmax, center=False
+        )
+        y = (torch.log(torch.clamp(y, min=1e-5)) - self.mel_mean) / self.mel_std
+        y_lengths = (batch['audio_lengths'] // self.hop_length).long()
+        
+        mu, logw, x_mask = self.model.encoder(x, x_lengths, spks)
+        
+        with torch.no_grad():
+            y_max_length = y.shape[-1]
+            y_mask = sequence_mask(y_lengths, y_max_length).unsqueeze(1).to(x_mask)
+            attn_mask = x_mask.unsqueeze(-1) * y_mask.unsqueeze(2)
+            
+            const = -0.5 * math.log(2 * math.pi) * self.model.encoder.encoder_params.n_feats
+            factor = -0.5 * torch.ones(mu.shape, dtype=mu.dtype, device=mu.device)
+            y_square = torch.matmul(factor.transpose(1, 2), y**2)
+            y_mu_double = torch.matmul(2.0 * (factor * mu).transpose(1, 2), y)
+            mu_square = torch.sum(factor * (mu**2), 1).unsqueeze(-1)
+            log_prior = y_square - y_mu_double + mu_square + const
+            path = maximum_path(log_prior, attn_mask.squeeze(1))
+        
+        logw_ = torch.log(1e-8 + path.sum(dim=2).unsqueeze(1)) * x_mask
+        loss_duration = torch.sum((logw - logw_) ** 2) / torch.sum(x_lengths)
+        
+        mu_y = torch.matmul(path.transpose(1, 2), mu.transpose(1, 2)).transpose(1, 2)
+        
+        cfm_loss, _, _, _ = self.model.decoder.compute_loss(x1=y, mask=y_mask, mu=mu_y, spks=spks, cond=None)
+        
+        prior_loss = 0.5 * ((y - mu_y) ** 2 + math.log(2 * math.pi)) * y_mask
+        prior_loss = prior_loss.sum() / (y_mask.sum() * self.model.encoder.encoder_params.n_feats)
+        
+        loss = cfm_loss + loss_duration + prior_loss
+        
+        self.log("val/loss", loss, prog_bar=True, sync_dist=True)
+        self.log("val/cfm_loss", cfm_loss, sync_dist=True)
+        self.log("val/dur_loss", loss_duration, sync_dist=True)
+        self.log("val/prior_loss", prior_loss, sync_dist=True)
         
         return loss
 
@@ -463,7 +554,32 @@ def main():
     parser.add_argument("--gpus", type=int, default=torch.cuda.device_count() if torch.cuda.is_available() else 0)
     parser.add_argument("--data_root", type=str, default="LJSpeech-1.1", help="Path to LJSpeech dataset root")
     parser.add_argument("--precision", type=str, default="16-mixed", help="Training precision (16-mixed, 32, etc)")
+    parser.add_argument("--val_split", type=float, default=0.05, help="Fraction of data for validation (default 5%)")
+    parser.add_argument(
+        "--ckpt_path",
+        type=str,
+        default=None,
+        help="Optional Lightning checkpoint to resume from. Can be a .ckpt file or a directory containing .ckpt files.",
+    )
     args = parser.parse_args()
+
+    def resolve_ckpt_path(ckpt_path: Optional[str]) -> Optional[str]:
+        if not ckpt_path:
+            return None
+
+        path = Path(ckpt_path).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint path does not exist: {path}")
+
+        if path.is_file():
+            if path.suffix != ".ckpt":
+                raise ValueError(f"Checkpoint file must end with .ckpt: {path}")
+            return str(path)
+
+        ckpts = sorted(path.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not ckpts:
+            raise FileNotFoundError(f"No .ckpt files found in directory: {path}")
+        return str(ckpts[0])
 
     # Params
     params = get_default_params()
@@ -478,7 +594,17 @@ def main():
 
     # Effective batch size scaling
     batch_size = args.batch_size
-    train_dataset = LJSpeechDataset(args.data_root) 
+    full_dataset = LJSpeechDataset(args.data_root)
+    
+    # Split into train/val
+    from torch.utils.data import random_split
+    val_size = int(len(full_dataset) * args.val_split)
+    train_size = len(full_dataset) - val_size
+    train_dataset, val_dataset = random_split(
+        full_dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)  # Fixed seed for reproducibility
+    )
+    print(f"Dataset split: {train_size} train, {val_size} validation")
     
     # Auto-adjust workers: 4 GPUs -> likely powerful CPU. Use 16 workers.
     # Since we use RAM caching, workers don't need to do disk I/O, just tensor conversion.
@@ -495,16 +621,27 @@ def main():
         pin_memory=True
     )
     
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        collate_fn=collate_fn,
+        shuffle=False,
+        num_workers=num_workers,
+        persistent_workers=True,
+        pin_memory=True
+    )
+    
     # Trainer
     from lightning.pytorch.loggers import TensorBoardLogger
     logger = TensorBoardLogger("lightning_logs", name="matcha_tts")
     
     checkpoint_callback = ModelCheckpoint(
-        monitor="train/loss", 
+        monitor="val/loss",  # Monitor validation loss
         mode="min", 
-        every_n_epochs=1,
-        save_top_k=-1, # Keep all checkpoints saved every 1 epoch
-        filename="matcha-epoch{epoch:02d}-loss{train/loss:.2f}"
+        every_n_epochs=2,
+        save_top_k=3,  # Keep top 3 best checkpoints
+        save_last=True,  # Also save last checkpoint
+        filename="matcha-epoch{epoch:02d}-val_loss{val/loss:.2f}"
     )
     trainer = Trainer(
         max_epochs=args.epochs,
@@ -515,11 +652,15 @@ def main():
         gradient_clip_val=5.0, # Checkpoint 4: Added gradient clipping verified from config/trainer/default.yaml
         callbacks=[checkpoint_callback],
         logger=logger,
-        log_every_n_steps=5
+        log_every_n_steps=5,
+        val_check_interval=0.5,  # Validate every half epoch
     )
     
     print(f"Starting training on {args.gpus} GPUs with precision {args.precision}...")
-    trainer.fit(model, train_loader)
+    ckpt_path = resolve_ckpt_path(args.ckpt_path)
+    if ckpt_path:
+        print(f"Resuming from checkpoint: {ckpt_path}")
+    trainer.fit(model, train_loader, val_loader, ckpt_path=ckpt_path)
 
 if __name__ == "__main__":
     main()

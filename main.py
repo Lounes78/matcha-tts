@@ -16,8 +16,7 @@ from model import MatchaTTS
 # ----------------------------------------------------------------------------------------------------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # CHECKPOINT_PATH = "matcha_ljspeech.ckpt"
-CHECKPOINT_PATH = "lightning_logs/matcha_tts/version_0/checkpoints/epoch=17-step=936.ckpt"
-
+CHECKPOINT_PATH = "/home/lounes/tts/matcha-tts/lightning_logs/matcha_tts/version_16/checkpoints/matcha-epochepoch=01-losstrain/loss=2.71.ckpt"
 VOCODER_URL = "https://github.com/shivammehta25/Matcha-TTS-checkpoints/releases/download/v1.0/generator_v1"
 VOCODER_PATH = "generator_v1"
 
@@ -78,12 +77,17 @@ def load_custom_matcha(checkpoint_path, device):
     # If channels[0] is 256, then 256 * 4 = 1024. Matches!
     
     encoder_params = SimpleNamespace(
-        encoder_type="roformer", n_feats=80, n_channels=192, filter_channels=768,
+        encoder_type="RoPE Encoder", n_feats=80, n_channels=192, filter_channels=768,
         n_heads=2, n_layers=6, kernel_size=3, p_dropout=0.1, prenet=True
     )
     decoder_params = SimpleNamespace(
-        channels=(256, 256), num_res_blocks=2, num_transformer_blocks=1,
-        num_heads=2, time_emb_dim=256, time_mlp_dim=512, dropout=0.0, ffn_mult=4
+        channels=(256, 256), 
+        dropout=0.05, 
+        attention_head_dim=64,
+        n_blocks=1, 
+        num_mid_blocks=2, 
+        num_heads=2, 
+        act_fn="snakebeta" 
     )
     cfm_params = {"solver": "euler", "sigma_min": 1e-4}
     duration_predictor_params = SimpleNamespace(
@@ -125,7 +129,8 @@ def load_custom_matcha(checkpoint_path, device):
 
     # DEBUG: Check for mel_mean/std in state_dict
     if "mel_mean" in state_dict:
-        print(f"Found mel_mean in checkpoint: shape {state_dict['mel_mean'].shape}")
+        print(f"Found mel_mean in checkpoint: {state_dict['mel_mean']}")
+        print(f"Found mel_std in checkpoint: {state_dict['mel_std']}")
     else:
         print("WARNING: mel_mean NOT found in checkpoint!")
 
@@ -202,7 +207,8 @@ def main():
         mel = output[0] # output is (mel, lengths) tuple in your model.py
         
         print(f"Mel Shape: {mel.shape}")
-
+        print(f"Mel Min: {mel.min().item():.4f}, Max: {mel.max().item():.4f}, Mean: {mel.mean().item():.4f}")
+        
     # E. Generate Audio with Vocoder
     print("Generating Audio...")
     vocoder = load_vocoder(DEVICE)
@@ -212,6 +218,18 @@ def main():
     # F. Save
     sf.write("infer_output.wav", audio.numpy(), 22050)
     print("Done! Saved to infer_output.wav")
+    
+    # G. Plot Attention (Validation)
+    import matplotlib.pyplot as plt
+    attn = output[2].squeeze().cpu().numpy() # output[2] is attn from synthesize
+    plt.figure(figsize=(10, 4))
+    plt.imshow(attn, origin='lower', aspect='auto')
+    plt.colorbar()
+    plt.title("Alignment (Attention)")
+    plt.xlabel("Mel Frames")
+    plt.ylabel("Text Tokens")
+    plt.savefig("alignment.png")
+    print("Saved alignment plot to alignment.png")
 
 if __name__ == "__main__":
     main()

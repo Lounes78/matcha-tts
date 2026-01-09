@@ -1155,7 +1155,8 @@ class CFM(BASECFM):
 
         pred = self.estimator(y_t, mask, mu, t.squeeze(), spks, cond)
 
-        loss = F.mse_loss(pred * mask, u_t * mask, reduction="sum") / (
+        # Original: NO mask multiplication - estimator handles masking internally
+        loss = F.mse_loss(pred, u_t, reduction="sum") / (
             torch.sum(mask) * u_t.shape[1]
         )
         return loss, y_t, pred, u_t
@@ -1296,6 +1297,6 @@ class MatchaTTS(nn.Module):
         # Crop back to original length if needed (though usually we decode the padded version)
         mel = mel[:, :, :y_max_length]
         
-        return mel, y_lengths
+        return mel, y_lengths, attn
     
 
