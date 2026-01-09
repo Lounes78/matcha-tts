@@ -1211,16 +1211,14 @@ class MatchaTTS(nn.Module):
 
         decoder_module = Decoder(
             in_channels=decoder_in_channels,
-            mu_channels=encoder_params.n_feats,
             out_channels=encoder_params.n_feats,
             channels=decoder_params.channels,
-            num_res_blocks=decoder_params.num_res_blocks,
-            num_transformer_blocks=decoder_params.num_transformer_blocks,
-            num_heads=decoder_params.num_heads,
-            time_emb_dim=decoder_params.time_emb_dim,
-            time_mlp_dim=decoder_params.time_mlp_dim,
             dropout=decoder_params.dropout,
-            ffn_mult=decoder_params.ffn_mult,
+            attention_head_dim=decoder_params.attention_head_dim,
+            n_blocks=decoder_params.n_blocks,
+            num_mid_blocks=decoder_params.num_mid_blocks,
+            num_heads=decoder_params.num_heads,
+            act_fn=decoder_params.act_fn,
         )
 
         # 3. Initialize CFM (Flow Matching) - This is 'self.decoder' in the checkpoint

@@ -247,11 +247,19 @@ class MatchaLightning(LightningModule):
             
         cfm_loss, _, _, _ = self.model.decoder.compute_loss(y, y_mask, mu_y, spks, cond=None)
         
-        loss = cfm_loss + loss_duration
+        # 6. Prior Loss (Added matching original implementation)
+        # prior_loss = torch.sum(0.5 * ((y - mu_y) ** 2 + math.log(2 * math.pi)) * y_mask)
+        # prior_loss = prior_loss / (torch.sum(y_mask) * self.n_feats)
+        # Re-calc manually:
+        prior_loss = 0.5 * ((y - mu_y) ** 2 + math.log(2 * math.pi)) * y_mask
+        prior_loss = prior_loss.sum() / (y_mask.sum() * self.model.encoder.encoder_params.n_feats)
+
+        loss = cfm_loss + loss_duration + prior_loss
         
         self.log("train/loss", loss, prog_bar=True)
         self.log("train/cfm_loss", cfm_loss)
         self.log("train/dur_loss", loss_duration)
+        self.log("train/prior_loss", prior_loss)
         
         return loss
 
@@ -363,11 +371,15 @@ def get_default_params():
         n_heads=2, n_layers=6, kernel_size=3, p_dropout=0.1, prenet=True
     )
     # Decoder Params:
-    # channels=[256, 256], n_blocks=1 (transformer depth), num_mid_blocks=2, num_heads=2
-    # dropout=0.05 (matches config/model/decoder/default.yaml)
+    # Based on Original Matcha-TTS configs/model/decoder/default.yaml
     decoder_params = SimpleNamespace(
-        channels=(256, 256), num_res_blocks=2, num_transformer_blocks=1,
-        num_heads=2, time_emb_dim=256, time_mlp_dim=512, dropout=0.05, ffn_mult=4
+        channels=(256, 256), 
+        dropout=0.05, 
+        attention_head_dim=64,
+        n_blocks=1, 
+        num_mid_blocks=2, 
+        num_heads=2, 
+        act_fn="snakebeta" 
     )
     cfm_params = {"solver": "euler", "sigma_min": 1e-4}
     duration_predictor_params = SimpleNamespace(
@@ -428,8 +440,8 @@ def main():
     checkpoint_callback = ModelCheckpoint(
         monitor="train/loss", 
         mode="min", 
-        every_n_epochs=3,
-        save_top_k=-1, # Keep all checkpoints saved every 3 epochs
+        every_n_epochs=1,
+        save_top_k=-1, # Keep all checkpoints saved every 1 epoch
         filename="matcha-epoch{epoch:02d}-loss{train/loss:.2f}"
     )
     trainer = Trainer(
